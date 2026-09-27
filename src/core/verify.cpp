@@ -622,7 +622,7 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, nullptr, nullptr, 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
@@ -691,7 +691,7 @@ bool Verifier::capture_commit(std::string& err) {
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, nullptr, nullptr, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
         return false;

@@ -385,7 +385,7 @@ int main(int argc, char** argv) {
                                     n, bits, bias, group, out + 1, stream);
                                 strata::kernels::scale_inplace(out + 1, n, 2.0f, stream);
                                 check(cudaStreamEndCapture(stream, &graph), "embedding capture end");
-                                check(cudaGraphInstantiate(&exec, graph, 0), "embedding instantiate");
+                                check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "embedding instantiate");
                                 check(cudaGraphLaunch(exec, stream), "embedding replay");
                                 check(cudaMemcpyAsync(got.data(), out, got.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "embedding graph result");
                                 check(cudaStreamSynchronize(stream), "embedding graph sync");

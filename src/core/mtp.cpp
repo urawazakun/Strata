@@ -426,7 +426,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
         return false;

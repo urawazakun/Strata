@@ -775,7 +775,7 @@ int main(int argc, char** argv) {
         strata::kernels::qsa_index_step(pooled.p, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
         strata::kernels::topk_512_step(scores.p, S, cap, step.p, ids.p, stream);
         check(cudaStreamEndCapture(stream, &graph), "tail capture end");
-        check(cudaGraphInstantiate(&exec, graph, 0), "tail instantiate");
+        check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "tail instantiate");
 
         const std::vector<int64_t> counts = {
             1, 2, 3, 4, 511, 512, 513, 2046, 2047, 2048, 2049, 2050, 2051,
@@ -1323,7 +1323,7 @@ int main(int argc, char** argv) {
         size_t nodes2 = 0;
         check(cudaGraphGetNodes(g2, nullptr, &nodes2), "nodes");
         cudaGraphExec_t ex2 = nullptr;
-        check(cudaGraphInstantiate(&ex2, g2, 0), "inst");
+        check(cudaGraphInstantiate(&ex2, g2, nullptr, nullptr, 0), "inst");
 
         // replay A: cells 0..3, which completes block 0
         for (int t = 0; t < 4; ++t) {
