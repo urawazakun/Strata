@@ -3,6 +3,17 @@
 <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
 one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
 
+> **This fork: Tesla V100 / Volta (sm_70) on Windows, CUDA 11.8.**
+> For cards and drivers the main project does not cover: compute capability 7.0 and NVIDIA drivers 452 or newer
+> (tested: Tesla V100-SXM2 16 GB, driver 472.12, i7 with AVX2, 128 GB RAM).
+> Measured with GSQ-RCO Q2_0 + MTP: **51-53 tok/s decode, ~545 tok/s prefill** at 8K context; 131K context starts with
+> `--kv int8` and 6400 cached experts.
+> `START-HERE.bat` downloads the ready-made sm_70 engine from this fork's
+> [releases](https://github.com/urawazakun/Strata/releases) and the CUDA 11 libraries from pip.
+> Build notes and measurements: [Docs/windows-cuda118.md](Docs/windows-cuda118.md). Answer **no** to "Images?" (the
+> vision helper is not built for sm_70 yet). Long prompts (~60K tokens) have crashed the GPU once on this machine;
+> treat very long contexts as experimental.
+
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
 normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
 of a word): faster than you can read.

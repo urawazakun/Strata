@@ -49,11 +49,11 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
 # "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
-PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
+PREBUILT_URL = "https://github.com/urawazakun/Strata/releases/latest/download/"   # win-cuda118 (V100) builds
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
-# the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
-CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
-MIN_DRIVER = 580                       # CUDA 13.0
+# the CUDA libraries the ready-made engine loads (the same CUDA 11.8 it is built with), from NVIDIA's pip packages
+CUDA_WHEELS = ["nvidia-cublas-cu11==11.11.3.6", "nvidia-cuda-runtime-cu11==11.8.89"]
+MIN_DRIVER = 452                       # CUDA 11.x minor-version compatibility (an 11.8 build runs on 452.39+)
 MIN_ENGINE = (0, 1, 1)                 # the ready-made engine that reads split models (Swift 1.5)
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow"]
 
@@ -222,12 +222,21 @@ def _cpuid_avx512_full() -> bool:
         return False
 
 
+# Drivers older than ~510 have no compute_cap query field; these are the Volta/Turing cards they commonly run.
+CC_BY_NAME = {"V100": "70", "TITAN V": "70", "GV100": "70", "T4": "75", "RTX 20": "75", "TITAN RTX": "75"}
+
+
 def gpu_info():
     s = out(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap,driver_version", "--format=csv,noheader,nounits"])
-    if not s.strip():
+    if "," in s:
+        name, mem, cc, drv = [x.strip() for x in s.strip().splitlines()[0].split(",")]
+        return {"name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""), "driver": drv}
+    s = out(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"])
+    if "," not in s:
         return None
-    name, mem, cc, drv = [x.strip() for x in s.strip().splitlines()[0].split(",")]
-    return {"name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""), "driver": drv}
+    name, mem, drv = [x.strip() for x in s.strip().splitlines()[0].split(",")]
+    cc = next((v for k, v in CC_BY_NAME.items() if k in name.upper()), "0")
+    return {"name": name, "vram_gb": float(mem) / 1024.0, "arch": cc, "driver": drv}
 
 
 def find_nvcc():
@@ -241,10 +250,10 @@ def find_nvcc():
     else:
         cands += [str(p / "bin" / "nvcc") for p in sorted(Path("/usr/local").glob("cuda*"), reverse=True)]
     best = (None, None)
-    for c in dict.fromkeys(cands):                     # every toolkit found; the newest wins
+    for c in dict.fromkeys(cands):                     # every CUDA 11.x toolkit found; the newest wins
         if c and Path(c).exists():
             v = re.search(r"release (\d+)\.(\d+)", out([c, "--version"]))
-            if v and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
+            if v and int(v.group(1)) == 11 and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
                 best = (c, (int(v.group(1)), int(v.group(2))))
     return best
 
@@ -378,13 +387,14 @@ def pip_install(packages, what):
 
 
 def cuda_lib_dirs():
-    """Where pip put NVIDIA's CUDA libraries (nvidia/cu13/bin/x86_64 on Windows, nvidia/cu13/lib on Linux)."""
-    pattern = "cublas64_13.dll" if WIN else "libcublas.so.13*"
+    """Where pip put NVIDIA's CUDA 11 libraries (nvidia/cublas/bin and nvidia/cuda_runtime/bin on Windows)."""
+    patterns = ["cublas64_11.dll", "cudart64_110.dll"] if WIN else ["libcublas.so.11*", "libcudart.so.11*"]
     dirs = []
     for sp in {Path(p) for p in sys.path if p.endswith("site-packages")}:
-        for hit in (sp / "nvidia").rglob(pattern) if (sp / "nvidia").is_dir() else []:
-            if hit.parent not in dirs:
-                dirs.append(hit.parent)
+        for pattern in patterns:
+            for hit in (sp / "nvidia").rglob(pattern) if (sp / "nvidia").is_dir() else []:
+                if hit.parent not in dirs:
+                    dirs.append(hit.parent)
     return [str(d) for d in dirs]
 
 
@@ -459,14 +469,14 @@ def get_prebuilt(url_base, gpu, vision) -> Path | None:
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
     nvcc, cuda_v = find_nvcc()
-    need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
+    need_cuda = (11, 8)                                # this branch targets CUDA 11.8 (Volta, drivers 452+)
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
     if not have_cc:
         missing.append("Visual Studio 2022 Build Tools (C++)" if WIN else "the C++ compiler (build-essential)")
     if nvcc is None or cuda_v < need_cuda:
-        missing.append("the NVIDIA CUDA Toolkit 13.0")
+        missing.append("the NVIDIA CUDA Toolkit 11.8")
     if not missing:
         ok(f"build tools present (CUDA {cuda_v[0]}.{cuda_v[1]})")
         return nvcc, vcvars
@@ -486,7 +496,7 @@ def install_build_tools(gpu, yes):
                  "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
                 check=False)
         if nvcc is None or cuda_v < need_cuda:
-            run([*wg, "--id", "Nvidia.CUDA", "--version", "13.0"], check=False)
+            run([*wg, "--id", "Nvidia.CUDA", "--version", "11.8"], check=False)
         vcvars = find_vcvars()
     else:
         apt = shutil.which("apt-get")
@@ -645,8 +655,8 @@ def main() -> int:
              "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
     ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
        f"driver {gpu['driver']}")
-    if int(gpu["arch"]) < 80:
-        fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
+    if int(gpu["arch"]) < 70:
+        fail("this GPU is older than Volta (compute capability 7.0 is required)")
     if driver_major(gpu) < MIN_DRIVER:
         fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
              "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
