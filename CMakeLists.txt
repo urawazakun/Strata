@@ -24,6 +24,12 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# CUDA 11.8's nvcc accepts at most -std=c++17, and CMake propagates the project
+# CXX standard (CUDA20) to NVCC.  Host C++ stays C++20; device code builds as
+# C++17 (win-cuda118: verified the .cu TUs use no C++20-only constructs).
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
