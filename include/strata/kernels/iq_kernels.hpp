@@ -1,5 +1,5 @@
 // include/strata/kernels/iq_kernels.hpp - the i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
-// IQ4_NL) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files.
+// IQ4_NL, IQ4_XS) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files.
 //
 // The block layouts, codebook grids and dot products are llama.cpp's (ggml-common.h, ggml-cuda/vecdotq.cuh,
 // ggml-cuda/dequantize.cuh; MIT, see third_party/ggml/LICENSE and VERSION.txt), so a weight means exactly what it

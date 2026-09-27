@@ -32,8 +32,125 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
     return n / (d + 1e-30);
 }
 
+// (d) --selftest: a synthetic IQ4_XS gate/up case (gu 23 over down 20, and down 23), no GGUF needed. The
+// weights are quantized with ggml's own reference quantizer, the float reference dequantizes them with ggml's
+// to_float, the CPU path uses ggml-cpu's vec_dot, and the GPU path is native_expert_grouped.
+static int run_synthetic(cudaStream_t s, int gu_type, int d_type, int64_t H, int64_t FF, int seed) {
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(gu_type, d_type, H, FF, f, err)) {
+        std::printf("selftest %d/%d: %s\n", gu_type, d_type, err.c_str());
+        return 1;
+    }
+    const auto* tg = ggml_get_type_traits((ggml_type) gu_type);
+    const auto* td = ggml_get_type_traits((ggml_type) d_type);
+    const int NT = 2;
+    std::mt19937 rng((unsigned) seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> Gf((size_t) FF * H), Uf((size_t) FF * H), Df((size_t) H * FF);
+    for (auto& v : Gf) v = nd(rng);
+    for (auto& v : Uf) v = nd(rng);
+    for (auto& v : Df) v = nd(rng);
+    std::vector<uint8_t> blob(f.bytes);
+    for (int64_t r = 0; r < FF; ++r) {
+        tg->from_float_ref(Gf.data() + r * H, blob.data() + r * f.gu_row, H);
+        tg->from_float_ref(Uf.data() + r * H, blob.data() + f.up_off + r * f.gu_row, H);
+    }
+    for (int64_t r = 0; r < H; ++r) td->from_float_ref(Df.data() + r * FF, blob.data() + f.down_off + r * f.d_row, FF);
+    std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
+    for (int64_t r = 0; r < FF; ++r) {
+        tg->to_float(blob.data() + r * f.gu_row, G.data() + r * H, H);
+        tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
+    }
+    for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    std::vector<float> x((size_t) NT * H);
+    for (auto& v : x) v = nd(rng);
+    std::vector<float> ref((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
+    for (int k = 0; k < NT; ++k) {
+        std::vector<float> h(FF);
+        for (int64_t r = 0; r < FF; ++r) {
+            double g = 0, u = 0;
+            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * x[k * H + i]; u += (double) U[r * H + i] * x[k * H + i]; }
+            h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
+        }
+        for (int64_t r = 0; r < H; ++r) {
+            double o = 0;
+            for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
+            ref[k * H + r] = (float) o;
+        }
+    }
+    {
+        std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
+        std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
+        std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
+        const void* a[NT];
+        float* ffp[NT];
+        const void* hp[NT];
+        float* op[NT];
+        for (int k = 0; k < NT; ++k) {
+            cpu::native_quant_act(f, x.data() + k * H, act[k].data());
+            a[k] = act[k].data();
+            ffp[k] = ff[k].data();
+        }
+        cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
+        for (int k = 0; k < NT; ++k) {
+            cpu::native_quant_h(f, ff[k].data(), hq[k].data());
+            hp[k] = hq[k].data();
+            op[k] = got_c.data() + k * H;
+        }
+        cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
+    }
+    {
+        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+        void *dblob, *dx, *dxq, *dscr;
+        float* dout;
+        unsigned long long* dptr;
+        int32_t *dstart, *dn, *ddst, *dtok;
+        cudaMalloc(&dblob, blob.size());
+        cudaMalloc(&dx, x.size() * 4);
+        cudaMalloc(&dxq, (size_t) NT * H / 32 * 36);
+        cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF));
+        cudaMalloc((void**) &dout, (size_t) NT * H * 4);
+        cudaMalloc((void**) &dptr, 8);
+        cudaMalloc((void**) &dstart, 8);
+        cudaMalloc((void**) &dn, 4);
+        cudaMalloc((void**) &ddst, NT * 4);
+        cudaMalloc((void**) &dtok, NT * 4);
+        cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+        const unsigned long long p = (unsigned long long) dblob;
+        const int32_t st[2] = {0, NT}, one = 1, idx[2] = {0, 1};
+        cudaMemcpy(dptr, &p, 8, cudaMemcpyHostToDevice);
+        cudaMemcpy(dstart, st, 8, cudaMemcpyHostToDevice);
+        cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
+        strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
+        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        cudaStreamSynchronize(s);
+        cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+        cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
+        cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
+    }
+    const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
+    const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+    std::printf("selftest gu %-8s/%-7s H %4lld FF %4lld  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n",
+                ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), (long long) H,
+                (long long) FF, ec, eg, ecg, ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...]\n"); return 2; }
+    if (argc == 2 && std::string(argv[1]) == "--selftest") {
+        cudaStream_t s;
+        cudaStreamCreate(&s);
+        int failures = 0;
+        failures += run_synthetic(s, 23, 20, 256, 64, 101);
+        failures += run_synthetic(s, 23, 23, 256, 256, 102);
+        std::printf("native_expert_parity --selftest: %d failures\n", failures);
+        return failures ? 1 : 0;
+    }
     strata::GgufFile gguf(argv[1]);
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
