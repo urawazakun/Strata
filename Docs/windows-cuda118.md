@@ -34,3 +34,22 @@ ctest: 20/20 pass.
 At `--max-context 131072 --kv int8` the largest expert cache that starts and serves is 6400 slots (VRAM 16.19 / 16.26 GB). A 30k-token needle test answered correctly.
 
 The MTP runtime pack was built with `STRATA_GGUF_PY` pointing at a llama.cpp `gguf-py` checkout.
+
+## GSQ-RCO IQ3_S (3.5 bpw) and clock / energy
+
+IQ3_S needs two changes in this branch: IQ4_XS (type 23) in `native_expert_grouped`, and `gather_rows` for rows that are
+not 16-byte multiples (its MTP head row is 2100 B). Checked with `native_expert_parity --selftest` (ctest).
+Cache sizes that start: 3500 slots at 8K, 2800 at `--max-context 131072 --kv int8`.
+
+One pelican-SVG generation per point, GPU clock locked with `nvidia-smi -lgc`, energy from 2 Hz GPU power samples:
+
+| quant | clock | tok/s | J/token (GPU) |
+|---|---|---|---|
+| Q2_0 | 600 MHz | 34.9 | 1.44 |
+| Q2_0 | 900 MHz | 47.6 | 1.22 |
+| Q2_0 | 1500 MHz | 62.3 | 1.87 |
+| IQ3_S | 600 MHz | 26.3 | 1.89 |
+| IQ3_S | 900 MHz | 34.5 | 1.60 |
+
+IQ3_S matched a Q4_K_XL llama.cpp baseline on our small math (15/15) and code (8/8) sets; Q2_0 lost visibly on SVG
+drawing. 900 MHz is the best tokens-per-joule point for both.
