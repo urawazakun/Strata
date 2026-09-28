@@ -35,7 +35,7 @@ At `--max-context 131072 --kv int8` the largest expert cache that starts and ser
 
 The MTP runtime pack was built with `STRATA_GGUF_PY` pointing at a llama.cpp `gguf-py` checkout.
 
-## GSQ-RCO IQ3_S (3.5 bpw) and clock / energy
+## GSQ-RCO IQ3_S (3.5 bpw) and the clock sweet spot
 
 IQ3_S needs two changes in this branch: IQ4_XS (type 23) in `native_expert_grouped`, and `gather_rows` for rows that are
 not 16-byte multiples (its MTP head row is 2100 B). Checked with `native_expert_parity --selftest` (ctest).
@@ -51,5 +51,10 @@ One pelican-SVG generation per point, GPU clock locked with `nvidia-smi -lgc`, e
 | IQ3_S | 600 MHz | 26.3 | 1.89 |
 | IQ3_S | 900 MHz | 34.5 | 1.60 |
 
+**Sweet spot: lock the core clock at ~900 MHz** (`nvidia-smi -lgc 135,900`, admin). Against the stock 1500 MHz boost,
+Q2_0 keeps 76 % of the speed (47.6 vs 62.3 tok/s) for 65 % of the GPU energy per token (1.22 vs 1.87 J), and the card
+runs cool and quiet (~55 W average, ~54 °C in daily use). Going lower (600 MHz) costs speed without saving energy per
+token. Decode here is bound by expert traffic over PCIe and host RAM, so the top clocks buy relatively little.
+
 IQ3_S matched a Q4_K_XL llama.cpp baseline on our small math (15/15) and code (8/8) sets; Q2_0 lost visibly on SVG
-drawing. 900 MHz is the best tokens-per-joule point for both.
+drawing.
