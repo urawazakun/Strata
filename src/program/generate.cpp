@@ -228,6 +228,8 @@ struct Options {
     bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
+    /// Plan v0.3 P8b: `--no-prefix-cache` disables prompt prefix reuse (the A/B arm: full prefill).
+    bool no_prefix_cache = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
@@ -291,6 +293,8 @@ void usage() {
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native)\n"
+                 "  --no-prefix-cache  A/B: full prefill every --serve request (default: a repeated prompt\n"
+                 "                       prefix resumes from snapshots at prefill chunk boundaries)\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -367,6 +371,157 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
         out.push_back(id);
     }
     if (out.empty()) { err = "token list was empty"; return false; }
+    return true;
+}
+
+// ================================ plan v0.3 P8b: PROMPT PREFIX REUSE ================================
+//
+// Agent turns re-send the whole conversation, so turn N+1's prompt is turn N's prompt plus the reply
+// and the tool result: almost all of it was already prefilled.  On a prefix hit the engine restores
+// the state at the longest reusable boundary and prefills only the new suffix.
+//
+// WHAT IS SNAPSHOTTED, AND WHY ONLY THAT.  The QSA KV pools, the indexer pooled keys and the MTP
+// draft layer's K/V are append-only by absolute position: a cell, once written, is never rewritten
+// at the same position, and no query ever reads a cell past the current length - so a stale cell
+// beyond the restored length is unreachable and they need no copy (restore is a logical truncation,
+// and the suffix prefill overwrites exactly the range decode polluted).  The indexer `dead` key is
+// written only at position 0 and never again.  What cannot roll back is the GDN recurrence + conv
+// history (36 layers), the QSA indexer tail (the in-progress block's raw keys) + block_pos, and the
+// PLE conv history + its two-token window.  Those go to pinned host memory at each prefill chunk
+// boundary (the 131K / cache-2800 config has only ~500 MB free on the device, so the device is not
+// an option).
+//
+// Snapshots are taken from the prefill itself, so the restored state is BITWISE what a cold prefill
+// of the prefix produced - and the suffix prefill is the same kernels in the same order, so the state
+// it leaves is bitwise the cold state and the output is identical, drafts included.  (The MTP layer
+// only writes drafts and never the output, but its prefill skips cells below
+// `prompt_len - window - 64`, so reuse additionally requires the new prompt to be no shorter than the
+// snapshotted one; a shorter prompt falls back to full prefill.)
+//
+// GENI (images) invalidates: image cells carry M-RoPE positions, so equal token ids need not mean
+// equal state.
+struct PrefixSnap {
+    int64_t pos = -1;            // tokens consumed: state == cold prefill of ids[0, pos)
+    int64_t prompt_len = 0;      // the request's full prompt length (MTP skip guard)
+    int64_t mtp_first = 0;       // prompt_len - window - 64 at take time
+    uint8_t* gdn = nullptr;      // pinned host, gdn_bytes
+    uint64_t gdn_bytes = 0;
+    std::vector<float> tails;    // n_qsa * tail_floats
+    std::vector<int32_t> block_pos;   // n_qsa
+    std::vector<float> ple_hist;
+    int32_t ple_prev[2] = {-1, -1};
+};
+
+struct PrefixCache {
+    std::vector<PrefixSnap> snaps;   // ascending by pos
+    std::vector<int64_t> prev_ids;   // the previous request's prompt
+    void clear() {
+        for (PrefixSnap& s : snaps)
+            if (s.gdn != nullptr) cudaFreeHost(s.gdn);
+        snaps.clear();
+        prev_ids.clear();
+    }
+};
+
+uint64_t prefix_gdn_floats(const strata::core::ModelGeometry& g) {
+    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+}
+
+bool prefix_take(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, PrefixCache& c,
+                 int64_t pos, int64_t prompt_len, int64_t mtp_first, void* stream) {
+    constexpr size_t kMaxSnaps = 12;
+    auto fail = [&](const char* what) {
+        std::fprintf(stderr, "strata serve: prefix snapshot at %lld failed (%s); caching off for this prompt\n",
+                     (long long) pos, what);
+        c.clear();
+        return false;
+    };
+    while (c.snaps.size() >= kMaxSnaps) {
+        PrefixSnap& old = c.snaps.front();
+        if (old.gdn != nullptr) cudaFreeHost(old.gdn);
+        c.snaps.erase(c.snaps.begin());
+    }
+    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+    const int64_t n_qsa = g.n_qsa_layers(), n_gdn = g.n_gdn_layers();
+    const uint64_t gdn_bytes = (uint64_t) n_gdn * prefix_gdn_floats(g) * 4;
+    const size_t tail_n = (size_t) (qs.idx_block - 1) * (size_t) g.idx_key_dim;
+    const size_t ple_n = (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    if (c.snaps.empty())
+        std::fprintf(stderr, "strata serve: prefix cache: snapshots are %.1f MiB each (GDN %.1f + tails/PLE %.1f), "
+                             "up to %d, pinned host memory\n", (double) (gdn_bytes + tail_n * n_qsa * 4 + ple_n * 4) / 1048576.0,
+                     (double) gdn_bytes / 1048576.0, (double) (tail_n * n_qsa * 4 + ple_n * 4) / 1048576.0,
+                     (int) kMaxSnaps);
+    PrefixSnap s;
+    s.pos = pos;
+    s.prompt_len = prompt_len;
+    s.mtp_first = mtp_first;
+    s.gdn_bytes = gdn_bytes;
+    if (cudaHostAlloc((void**) &s.gdn, gdn_bytes, cudaHostAllocDefault) != cudaSuccess) return fail("pinned alloc");
+    cudaStream_t cs = (cudaStream_t) stream;
+    if (cudaMemcpyAsync(s.gdn, ss.gdn_state, gdn_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+        cudaFreeHost(s.gdn);
+        return fail("GDN download");
+    }
+    s.tails.resize((size_t) n_qsa * tail_n);
+    s.block_pos.resize((size_t) n_qsa);
+    s.ple_hist.resize(ple_n);
+    for (int64_t i = 0; i < n_qsa; ++i) {
+        if (cudaMemcpyAsync(s.tails.data() + (size_t) i * tail_n, ss.qsa_states[i].idx_tail, tail_n * 4,
+                            cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+            cudaMemcpyAsync(&s.block_pos[(size_t) i], ss.qsa_states[i].idx_block_pos, 4, cudaMemcpyDeviceToHost,
+                            cs) != cudaSuccess) {
+            cudaFreeHost(s.gdn);
+            return fail("indexer tail download");
+        }
+    }
+    if (cudaMemcpyAsync(s.ple_hist.data(), ss.ple_hist, ple_n * 4, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+        cudaFreeHost(s.gdn);
+        return fail("PLE history download");
+    }
+    s.ple_prev[0] = ss.ple_prev[0];
+    s.ple_prev[1] = ss.ple_prev[1];
+    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        cudaFreeHost(s.gdn);
+        return fail("sync");
+    }
+    c.snaps.push_back(std::move(s));
+    return true;
+}
+
+bool prefix_restore(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const PrefixSnap& s,
+                    void* stream, std::string& err) {
+    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+    const uint64_t gdn_bytes = (uint64_t) g.n_gdn_layers() * prefix_gdn_floats(g) * 4;
+    const size_t tail_n = (size_t) (qs.idx_block - 1) * (size_t) g.idx_key_dim;
+    const size_t ple_n = (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    if (s.gdn_bytes != gdn_bytes || s.tails.size() != (size_t) g.n_qsa_layers() * tail_n ||
+        s.block_pos.size() != (size_t) g.n_qsa_layers() || s.ple_hist.size() != ple_n) {
+        err = "prefix snapshot geometry mismatch";
+        return false;
+    }
+    cudaStream_t cs = (cudaStream_t) stream;
+    if (cudaMemcpyAsync(ss.gdn_state, s.gdn, gdn_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+        err = "prefix restore: GDN upload";
+        return false;
+    }
+    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+        if (cudaMemcpyAsync(ss.qsa_states[i].idx_tail, s.tails.data() + (size_t) i * tail_n, tail_n * 4,
+                            cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+            cudaMemcpyAsync(ss.qsa_states[i].idx_block_pos, &s.block_pos[(size_t) i], 4, cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess) {
+            err = "prefix restore: indexer tail upload";
+            return false;
+        }
+    }
+    if (cudaMemcpyAsync(ss.ple_hist, s.ple_hist.data(), ple_n * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+        err = "prefix restore: PLE history upload";
+        return false;
+    }
+    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        err = "prefix restore: sync";
+        return false;
+    }
     return true;
 }
 
@@ -543,6 +698,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
+        else if (a == "--no-prefix-cache") o.no_prefix_cache = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
@@ -1806,11 +1962,25 @@ int main(int argc, char** argv) {
         ver.set_split(o.spec_split);
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
+        // P8b: the previous request's prompt and the snapshots taken while prefilling it.  Snapshots
+        // accumulate during a request's prefill and are replaced by the next request's; a GENI request
+        // clears them (image cells carry M-RoPE positions, so equal ids need not mean equal state).
+        // Declared before on_chunk: the hook reads them through the capture.
+        PrefixCache prefix_cache;
+        bool req_cacheable = false;   // this request takes snapshots (set per request; read by on_chunk)
+        int64_t req_n = 0;            // this request's prompt length (MTP skip guard)
+        int64_t req_mtp_first = 0;    // cells at or below this were skipped by this request's MTP prefill
         std::vector<int64_t> cur;
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
-            return mtp.prefill(R_rows, nxt.data(), T, p0, e);
+            if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
+            // P8b: the state now equals a cold prefill of [0, p0+T): snapshot the non-truncatable
+            // part so a later request can resume here.  A failed snapshot only disables caching.
+            if (req_cacheable &&
+                !prefix_take(g, ss, prefix_cache, p0 + T, req_n, req_mtp_first, main_cs))
+                req_cacheable = false;
+            return true;
         };
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
@@ -1994,8 +2164,53 @@ int main(int argc, char** argv) {
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
-            strata::core::session_zero(ss, g, nullptr, main_cs);
-            cudaStreamSynchronize(main_stream);
+            // P8b: the longest common prefix with the previous prompt; resume from the largest
+            // snapshot at or before it (a snapshot at P is bitwise the cold state at P).  The MTP
+            // draft layer's prefill skips cells below prompt_len - window - 64, so the new prompt
+            // must be no shorter than the snapshotted one, or the drafts would read skipped cells.
+            req_n = n;
+            req_mtp_first = (o.mtp_window > 0 && n > 0) ? n - o.mtp_window - 64 : 0;
+            req_cacheable = !o.no_prefix_cache && !geni;
+            int64_t lcp = 0;
+            while (lcp < n && lcp < (int64_t) prefix_cache.prev_ids.size() &&
+                   prefix_cache.prev_ids[(size_t) lcp] == ids[(size_t) lcp])
+                ++lcp;
+            const PrefixSnap* hit = nullptr;
+            if (req_cacheable && !geni) {
+                for (const PrefixSnap& s : prefix_cache.snaps)
+                    if (s.pos <= lcp && s.prompt_len <= n && s.mtp_first <= req_mtp_first &&
+                        (hit == nullptr || s.pos > hit->pos))
+                        hit = &s;
+            }
+            if (geni) prefix_cache.clear();
+            int64_t pre0 = 0;
+            if (hit != nullptr) {
+                pre0 = hit->pos;
+                const int32_t pp0 = pre0 >= 2 ? (int32_t) ids[(size_t) (pre0 - 2)] : -1;
+                const int32_t pp1 = pre0 >= 1 ? (int32_t) ids[(size_t) (pre0 - 1)] : -1;
+                if (!prefix_restore(g, ss, *hit, main_cs, err)) {
+                    std::fprintf(stderr, "strata serve: %s; falling back to full prefill\n", err.c_str());
+                    prefix_cache.clear();
+                    req_cacheable = !o.no_prefix_cache && !geni;
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    cudaStreamSynchronize(main_stream);
+                    pre0 = 0;
+                } else {
+                    ss.ple_prev[0] = pp0;
+                    ss.ple_prev[1] = pp1;
+                    std::fprintf(stderr, "strata serve: prefix reuse: lcp %lld, resume at %lld, prefilling %lld "
+                                         "of %lld prompt tokens\n",
+                                 (long long) lcp, (long long) pre0, (long long) (n - 1 - pre0), (long long) n);
+                }
+            } else {
+                if (!prefix_cache.prev_ids.empty() && req_cacheable)
+                    std::fprintf(stderr, "strata serve: prefix reuse: lcp %lld too short, full prefill\n",
+                                 (long long) lcp);
+                strata::core::session_zero(ss, g, nullptr, main_cs);
+                cudaStreamSynchronize(main_stream);
+            }
+            prefix_cache.clear();   // the restored bytes are already back on the device; the
+                                    // prefill below takes this request's own snapshots
             mtp.set_prompt_len(n);
             std::vector<std::pair<int32_t, int32_t>> lent_now;
             apply_pending(true);
@@ -2007,11 +2222,15 @@ int main(int argc, char** argv) {
                     }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
-            if (n > 1 && !sp.run(ids.data(), n - 1, 0, err)) {
+            if (n - 1 > pre0 && !sp.run(ids.data() + pre0, n - 1 - pre0, pre0, err)) {
                 std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                 std::printf("ERR %s\n", err.c_str());
+                prefix_cache.clear();
                 return 1;
             }
+            // P8b: the prefill above took this request's snapshots (via on_chunk); a request that
+            // took none (GENI, --no-prefix-cache, or a failed snapshot) leaves nothing reusable.
+            if (req_cacheable && !prefix_cache.snaps.empty()) prefix_cache.prev_ids = ids;
             for (const auto& [i, slot] : lent_now) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
