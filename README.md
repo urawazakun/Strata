@@ -8,13 +8,11 @@ one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to in
 > (tested: Tesla V100-SXM2 16 GB, driver 472.12, i7 with AVX2, 128 GB RAM).
 > Measured with GSQ-RCO Q2_0 + MTP: **51-53 tok/s decode, ~545 tok/s prefill** at 8K context; 131K context starts with
 > `--kv int8` and 6400 cached experts. **GSQ-RCO IQ3_S** (3.5 bpw, IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS experts) also runs and is
-> the better pick for quality: 34.5 tok/s at a 900 MHz clock cap, 131K context with `--kv int8` and 2800 cached experts.
+> the better pick for quality: 34.5 tok/s with the GPU clock locked at 900 MHz, 131K context with `--kv int8` and 2800 cached experts.
 > `START-HERE.bat` downloads the ready-made sm_70 engine from this fork's
 > [releases](https://github.com/urawazakun/Strata/releases) and the CUDA 11 libraries from pip.
 > Build notes and measurements: [Docs/windows-cuda118.md](Docs/windows-cuda118.md). Answer **no** to "Images?" (the
-> vision helper is not tested on sm_70 yet). The test card has dropped off the bus ("GPU is lost") under Strata at
-> high clocks (1300-1530 MHz); stress tests point at the card's power delivery, not at the software. It runs stable
-> capped at 900 MHz (`nvidia-smi -lgc 135,900`), which is also the best tokens-per-joule point.
+> vision helper is not tested on sm_70 yet).
 
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
 normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
