@@ -35,6 +35,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
@@ -47,6 +48,8 @@
 #include <chrono>
 #include <algorithm>
 #include <iostream>
+#include <memory>
+#include <numeric>
 #include <thread>
 #include <charconv>
 #include <cmath>
@@ -374,32 +377,22 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     return true;
 }
 
-// ================================ plan v0.3 P8b: PROMPT PREFIX REUSE ================================
+// ================================ plan v0.3 P8c: MULTI-PROMPT PREFIX REUSE ================================
 //
-// Agent turns re-send the whole conversation, so turn N+1's prompt is turn N's prompt plus the reply
-// and the tool result: almost all of it was already prefilled.  On a prefix hit the engine restores
-// the state at the longest reusable boundary and prefills only the new suffix.
+// P8b kept one prompt's snapshots and compared only with the previous prompt.  Hermes interleaves short
+// auxiliary requests (session titles) and every new session restarts with the same ~11.5K-token system+tools
+// prefix, so the next agent turn always missed.  P8c keeps a small LRU of self-contained entries in host RAM:
+// each entry holds the token ids of one long request, the P8b-style recurrent snapshots at its chunk/message
+// boundaries, and full host copies of that request's own QSA KV rows [0, entry_len) + indexer pooled rows +
+// `dead`.  A hit restores the recurrent snapshot AND the KV/indexer rows, so the device state for [0, snap)
+// is exactly this entry's prefix state no matter what unrelated request ran in between.  Self-contained
+// entries are the simplest correct scheme: no device-contents tracking, no partial-cover repair, no sharing.
+// (The first-attempt WIP used shared snapshots plus a KV-cover repair; it is strictly more complex and could
+// not hit the short-aux case its own design notes describe, so it was not reused.)
 //
-// WHAT IS SNAPSHOTTED, AND WHY ONLY THAT.  The QSA KV pools, the indexer pooled keys and the MTP
-// draft layer's K/V are append-only by absolute position: a cell, once written, is never rewritten
-// at the same position, and no query ever reads a cell past the current length - so a stale cell
-// beyond the restored length is unreachable and they need no copy (restore is a logical truncation,
-// and the suffix prefill overwrites exactly the range decode polluted).  The indexer `dead` key is
-// written only at position 0 and never again.  What cannot roll back is the GDN recurrence + conv
-// history (36 layers), the QSA indexer tail (the in-progress block's raw keys) + block_pos, and the
-// PLE conv history + its two-token window.  Those go to pinned host memory at each prefill chunk
-// boundary (the 131K / cache-2800 config has only ~500 MB free on the device, so the device is not
-// an option).
-//
-// Snapshots are taken from the prefill itself, so the restored state is BITWISE what a cold prefill
-// of the prefix produced - and the suffix prefill is the same kernels in the same order, so the state
-// it leaves is bitwise the cold state and the output is identical, drafts included.  (The MTP layer
-// only writes drafts and never the output, but its prefill skips cells below
-// `prompt_len - window - 64`, so reuse additionally requires the new prompt to be no shorter than the
-// snapshotted one; a shorter prompt falls back to full prefill.)
-//
-// GENI (images) invalidates: image cells carry M-RoPE positions, so equal token ids need not mean
-// equal state.
+// BUDGET.  ~112.6 MiB per recurrent snapshot (GDN) + ~12.7 KB/token/layer INT8 KV (~20 MiB for 13K tokens,
+// 12 layers) + pooled/indexer rows.  LRU evicts oldest-first at 4 GiB total.
+constexpr int64_t kImEnd = 248046;   // <|im_end|>: message-boundary checkpoints (system end etc.)
 struct PrefixSnap {
     int64_t pos = -1;            // tokens consumed: state == cold prefill of ids[0, pos)
     int64_t prompt_len = 0;      // the request's full prompt length (MTP skip guard)
@@ -412,14 +405,27 @@ struct PrefixSnap {
     int32_t ple_prev[2] = {-1, -1};
 };
 
+struct PrefixEntry {
+    std::vector<int64_t> ids;      // this entry's prompt (KV rows [0, ids.size()) copied below)
+    std::vector<PrefixSnap> snaps;  // ascending by pos
+    bool kv_int8 = false;          // KV mode the copies below were taken in
+    std::vector<std::vector<uint8_t>> kv;  // per QSA layer, codes+scales (identity page table)
+    std::vector<float> pooled;     // n_qsa * pooled_stride * idx_dim (blocks + spare row)
+    std::vector<float> dead;       // n_qsa * idx_dim (`dead` key, from cell 0's raw key)
+    int64_t pooled_stride = 0;     // idx_dim rows per layer in pooled
+};
+
 struct PrefixCache {
-    std::vector<PrefixSnap> snaps;   // ascending by pos
-    std::vector<int64_t> prev_ids;   // the previous request's prompt
+    std::vector<std::shared_ptr<PrefixEntry>> entries;  // oldest first
+    uint64_t bytes = 0;
+    void free_entry(PrefixEntry& e) {
+        for (PrefixSnap& s : e.snaps)
+            if (s.gdn != nullptr) { cudaFreeHost(s.gdn); s.gdn = nullptr; }
+    }
     void clear() {
-        for (PrefixSnap& s : snaps)
-            if (s.gdn != nullptr) cudaFreeHost(s.gdn);
-        snaps.clear();
-        prev_ids.clear();
+        for (auto& e : entries) free_entry(*e);
+        entries.clear();
+        bytes = 0;
     }
 };
 
@@ -428,30 +434,35 @@ uint64_t prefix_gdn_floats(const strata::core::ModelGeometry& g) {
            (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
 }
 
-bool prefix_take(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, PrefixCache& c,
-                 int64_t pos, int64_t prompt_len, int64_t mtp_first, void* stream) {
-    constexpr size_t kMaxSnaps = 12;
+uint64_t prefix_snap_bytes(const PrefixSnap& s) {
+    if (s.gdn == nullptr) return 0;
+    return s.gdn_bytes + (uint64_t) s.tails.size() * 4 + (uint64_t) s.block_pos.size() * 4 +
+           (uint64_t) s.ple_hist.size() * 4;
+}
+
+uint64_t prefix_entry_bytes(const PrefixEntry& e) {
+    uint64_t n = (uint64_t) e.ids.size() * 8 + (uint64_t) e.pooled.size() * 4 + (uint64_t) e.dead.size() * 4;
+    for (const PrefixSnap& s : e.snaps) n += prefix_snap_bytes(s);
+    for (const auto& v : e.kv) n += v.size();
+    return n;
+}
+
+// Takes the non-truncatable state (GDN recurrence + conv history, indexer tails + block_pos, PLE history
+// + token window) at the end of a prefill chunk.  The snapshot is a verbatim copy of the cold state at
+// `pos`, so a resume must start at exactly `pos` (never between snapshots: the tail below would mismatch).
+bool prefix_take_snap(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, PrefixSnap& out,
+                      int64_t pos, int64_t prompt_len, int64_t mtp_first, void* stream) {
     auto fail = [&](const char* what) {
-        std::fprintf(stderr, "strata serve: prefix snapshot at %lld failed (%s); caching off for this prompt\n",
+        std::fprintf(stderr, "strata serve: prefix snapshot at %lld failed (%s); no snapshot at this boundary\n",
                      (long long) pos, what);
-        c.clear();
+        if (out.gdn != nullptr) { cudaFreeHost(out.gdn); out.gdn = nullptr; }
         return false;
     };
-    while (c.snaps.size() >= kMaxSnaps) {
-        PrefixSnap& old = c.snaps.front();
-        if (old.gdn != nullptr) cudaFreeHost(old.gdn);
-        c.snaps.erase(c.snaps.begin());
-    }
     const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
     const int64_t n_qsa = g.n_qsa_layers(), n_gdn = g.n_gdn_layers();
     const uint64_t gdn_bytes = (uint64_t) n_gdn * prefix_gdn_floats(g) * 4;
     const size_t tail_n = (size_t) (qs.idx_block - 1) * (size_t) g.idx_key_dim;
     const size_t ple_n = (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
-    if (c.snaps.empty())
-        std::fprintf(stderr, "strata serve: prefix cache: snapshots are %.1f MiB each (GDN %.1f + tails/PLE %.1f), "
-                             "up to %d, pinned host memory\n", (double) (gdn_bytes + tail_n * n_qsa * 4 + ple_n * 4) / 1048576.0,
-                     (double) gdn_bytes / 1048576.0, (double) (tail_n * n_qsa * 4 + ple_n * 4) / 1048576.0,
-                     (int) kMaxSnaps);
     PrefixSnap s;
     s.pos = pos;
     s.prompt_len = prompt_len;
@@ -459,10 +470,8 @@ bool prefix_take(const strata::core::ModelGeometry& g, strata::core::SessionStat
     s.gdn_bytes = gdn_bytes;
     if (cudaHostAlloc((void**) &s.gdn, gdn_bytes, cudaHostAllocDefault) != cudaSuccess) return fail("pinned alloc");
     cudaStream_t cs = (cudaStream_t) stream;
-    if (cudaMemcpyAsync(s.gdn, ss.gdn_state, gdn_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
-        cudaFreeHost(s.gdn);
+    if (cudaMemcpyAsync(s.gdn, ss.gdn_state, gdn_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess)
         return fail("GDN download");
-    }
     s.tails.resize((size_t) n_qsa * tail_n);
     s.block_pos.resize((size_t) n_qsa);
     s.ple_hist.resize(ple_n);
@@ -470,27 +479,20 @@ bool prefix_take(const strata::core::ModelGeometry& g, strata::core::SessionStat
         if (cudaMemcpyAsync(s.tails.data() + (size_t) i * tail_n, ss.qsa_states[i].idx_tail, tail_n * 4,
                             cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
             cudaMemcpyAsync(&s.block_pos[(size_t) i], ss.qsa_states[i].idx_block_pos, 4, cudaMemcpyDeviceToHost,
-                            cs) != cudaSuccess) {
-            cudaFreeHost(s.gdn);
+                            cs) != cudaSuccess)
             return fail("indexer tail download");
-        }
     }
-    if (cudaMemcpyAsync(s.ple_hist.data(), ss.ple_hist, ple_n * 4, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
-        cudaFreeHost(s.gdn);
+    if (cudaMemcpyAsync(s.ple_hist.data(), ss.ple_hist, ple_n * 4, cudaMemcpyDeviceToHost, cs) != cudaSuccess)
         return fail("PLE history download");
-    }
     s.ple_prev[0] = ss.ple_prev[0];
     s.ple_prev[1] = ss.ple_prev[1];
-    if (cudaStreamSynchronize(cs) != cudaSuccess) {
-        cudaFreeHost(s.gdn);
-        return fail("sync");
-    }
-    c.snaps.push_back(std::move(s));
+    if (cudaStreamSynchronize(cs) != cudaSuccess) return fail("sync");
+    out = std::move(s);
     return true;
 }
 
-bool prefix_restore(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const PrefixSnap& s,
-                    void* stream, std::string& err) {
+bool prefix_restore_snap(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const PrefixSnap& s,
+                         void* stream, std::string& err) {
     const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
     const uint64_t gdn_bytes = (uint64_t) g.n_gdn_layers() * prefix_gdn_floats(g) * 4;
     const size_t tail_n = (size_t) (qs.idx_block - 1) * (size_t) g.idx_key_dim;
@@ -520,6 +522,92 @@ bool prefix_restore(const strata::core::ModelGeometry& g, strata::core::SessionS
     }
     if (cudaStreamSynchronize(cs) != cudaSuccess) {
         err = "prefix restore: sync";
+        return false;
+    }
+    return true;
+}
+
+// One layer's QSA KV rows between device and host.  The page table is the identity (set once at init,
+// never re-pointed), so logical rows [0, rows) are physical pages [0, P): contiguous ranges per array.
+// INT8 layout per src/kernels/cuda/kv_q8.cu: row = (page*n_head_kv + h)*page_size + (pos % page_size).
+bool prefix_kv_take_layer(const strata::kernels::QsaShapes& qs, const strata::core::QsaState& st, int64_t rows,
+                          std::vector<uint8_t>& out, void* stream, std::string& err) {
+    out.clear();
+    if (rows <= 0) return true;
+    cudaStream_t cs = (cudaStream_t) stream;
+    const int64_t P = (rows + qs.page_size - 1) / qs.page_size;
+    const uint64_t code_page = (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) qs.head_dim;
+    if (st.kv_int8) {
+        const uint64_t scale_page =
+            (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+        out.resize((size_t) P * (code_page * 2 + scale_page * 2));
+        uint8_t* d = out.data();
+        auto dl = [&](const void* src, uint64_t n) {
+            if (cudaMemcpyAsync(d, src, (size_t) n, cudaMemcpyDeviceToHost, cs) != cudaSuccess) return false;
+            d += n;
+            return true;
+        };
+        if (!dl(st.k_q, (uint64_t) P * code_page) || !dl(st.v_q, (uint64_t) P * code_page) ||
+            !dl(st.k_scale, (uint64_t) P * scale_page) || !dl(st.v_scale, (uint64_t) P * scale_page)) {
+            err = "prefix KV take: download";
+            return false;
+        }
+    } else {
+        out.resize((size_t) P * code_page * 2 * 2);
+        uint8_t* d = out.data();
+        if (cudaMemcpyAsync(d, st.k_pool, (size_t) P * code_page * 2, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+            cudaMemcpyAsync(d + (size_t) P * code_page * 2, st.v_pool, (size_t) P * code_page * 2,
+                            cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+            err = "prefix KV take: download";
+            return false;
+        }
+    }
+    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        err = "prefix KV take: sync";
+        return false;
+    }
+    return true;
+}
+
+bool prefix_kv_restore_layer(const strata::kernels::QsaShapes& qs, const strata::core::QsaState& st, int64_t rows,
+                             const std::vector<uint8_t>& in, void* stream, std::string& err) {
+    if (rows <= 0) return true;
+    cudaStream_t cs = (cudaStream_t) stream;
+    const int64_t P = (rows + qs.page_size - 1) / qs.page_size;
+    const uint64_t code_page = (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) qs.head_dim;
+    if (st.kv_int8) {
+        const uint64_t scale_page =
+            (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+        if (in.size() != (size_t) P * (code_page * 2 + scale_page * 2)) {
+            err = "prefix KV restore: size mismatch";
+            return false;
+        }
+        const uint8_t* s = in.data();
+        auto ul = [&](void* dst, uint64_t n) {
+            if (cudaMemcpyAsync(dst, s, (size_t) n, cudaMemcpyHostToDevice, cs) != cudaSuccess) return false;
+            s += n;
+            return true;
+        };
+        if (!ul(st.k_q, (uint64_t) P * code_page) || !ul(st.v_q, (uint64_t) P * code_page) ||
+            !ul(st.k_scale, (uint64_t) P * scale_page) || !ul(st.v_scale, (uint64_t) P * scale_page)) {
+            err = "prefix KV restore: upload";
+            return false;
+        }
+    } else {
+        if (in.size() != (size_t) P * code_page * 2 * 2) {
+            err = "prefix KV restore: size mismatch";
+            return false;
+        }
+        if (cudaMemcpyAsync(st.k_pool, in.data(), (size_t) P * code_page * 2, cudaMemcpyHostToDevice, cs) !=
+                cudaSuccess ||
+            cudaMemcpyAsync(st.v_pool, in.data() + (size_t) P * code_page * 2, (size_t) P * code_page * 2,
+                            cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+            err = "prefix KV restore: upload";
+            return false;
+        }
+    }
+    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        err = "prefix KV restore: sync";
         return false;
     }
     return true;
@@ -1962,24 +2050,51 @@ int main(int argc, char** argv) {
         ver.set_split(o.spec_split);
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
-        // P8b: the previous request's prompt and the snapshots taken while prefilling it.  Snapshots
-        // accumulate during a request's prefill and are replaced by the next request's; a GENI request
-        // clears them (image cells carry M-RoPE positions, so equal ids need not mean equal state).
-        // Declared before on_chunk: the hook reads them through the capture.
+        // P8c: the entry under construction for this request (null = no entry), plus the boundary
+        // positions it wants snapshots at (chunk ends and message ends).  Snapshots accumulate via
+        // on_chunk; short requests (< 2 chunks) leave none.  Declared before on_chunk: the hook reads
+        // them through the capture.
         PrefixCache prefix_cache;
+        std::shared_ptr<PrefixEntry> req_entry;
+        std::vector<int64_t> req_bounds;  // snapshot when a chunk ends at one of these (sorted, unique)
         bool req_cacheable = false;   // this request takes snapshots (set per request; read by on_chunk)
         int64_t req_n = 0;            // this request's prompt length (MTP skip guard)
         int64_t req_mtp_first = 0;    // cells at or below this were skipped by this request's MTP prefill
+        int64_t req_img_first = -1;   // first <|image_pad|> in this request (GENI), else -1
+        bool req_bounds_logged = false;
         std::vector<int64_t> cur;
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
-            for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
+            for (int64_t t = 0; t < T; ++t) {
+                const int64_t tok_pos = p0 + t + 1;
+                nxt[(size_t) t] = tok_pos < (int64_t) cur.size() ? (int32_t) cur[(size_t) tok_pos]
+                                                                 : (int32_t) cur.back();
+            }
             if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
-            // P8b: the state now equals a cold prefill of [0, p0+T): snapshot the non-truncatable
-            // part so a later request can resume here.  A failed snapshot only disables caching.
-            if (req_cacheable &&
-                !prefix_take(g, ss, prefix_cache, p0 + T, req_n, req_mtp_first, main_cs))
-                req_cacheable = false;
+            // P8c: the state now equals a cold prefill of [0, p0+T).  Snapshot wanted boundaries:
+            // chunk ends (multiples of the indexer block, so the pooled rows below are final) and
+            // message ends, so a volatile tail re-prefills only from there.  On GENI only boundaries
+            // at or before the first image are text state worth keeping.  A failed snapshot skips it.
+            if (req_cacheable && req_entry && (req_img_first < 0 || p0 + T <= req_img_first) &&
+                std::binary_search(req_bounds.begin(), req_bounds.end(), p0 + T)) {
+                if (!req_bounds_logged) {
+                    const strata::kernels::QsaShapes qs0 = strata::kernels::qsa_real_shapes();
+                    const uint64_t gdn0 =
+                        (uint64_t) g.n_gdn_layers() * prefix_gdn_floats(g) * 4;
+                    const size_t extra =
+                        (size_t) ((qs0.idx_block - 1) * (size_t) g.idx_key_dim) * (size_t) g.n_qsa_layers() +
+                        (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+                    std::fprintf(stderr,
+                                 "strata serve: prefix cache: snapshots are %.1f MiB each "
+                                 "(GDN %.1f + tails/PLE %.1f), entries hold boundaries + full KV, budget 4 GiB host\n",
+                                 (double) (gdn0 + extra * 4) / 1048576.0, (double) gdn0 / 1048576.0,
+                                 (double) extra * 4 / 1048576.0);
+                    req_bounds_logged = true;
+                }
+                PrefixSnap s;
+                if (prefix_take_snap(g, ss, s, p0 + T, req_n, req_mtp_first, main_cs))
+                    req_entry->snaps.push_back(std::move(s));
+            }
             return true;
         };
         drive.d.plan = ver.plan_sink();
@@ -2164,53 +2279,127 @@ int main(int argc, char** argv) {
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
-            // P8b: the longest common prefix with the previous prompt; resume from the largest
-            // snapshot at or before it (a snapshot at P is bitwise the cold state at P).  The MTP
-            // draft layer's prefill skips cells below prompt_len - window - 64, so the new prompt
-            // must be no shorter than the snapshotted one, or the drafts would read skipped cells.
+            // P8c: over every cached entry, the LCP with its ids; resume from the largest snapshot at
+            // or before it.  The MTP draft layer's prefill skips cells below prompt_len - window - 64,
+            // so the new prompt must be no shorter than the snapshotted one, or the drafts would read
+            // skipped cells.  GENI requests can reuse the text prefix before their first image; their
+            // own snapshots stop at the first image, and the entry is keyed by the text prefix there.
             req_n = n;
             req_mtp_first = (o.mtp_window > 0 && n > 0) ? n - o.mtp_window - 64 : 0;
-            req_cacheable = !o.no_prefix_cache && !geni;
-            int64_t lcp = 0;
-            while (lcp < n && lcp < (int64_t) prefix_cache.prev_ids.size() &&
-                   prefix_cache.prev_ids[(size_t) lcp] == ids[(size_t) lcp])
-                ++lcp;
-            const PrefixSnap* hit = nullptr;
-            if (req_cacheable && !geni) {
-                for (const PrefixSnap& s : prefix_cache.snaps)
-                    if (s.pos <= lcp && s.prompt_len <= n && s.mtp_first <= req_mtp_first &&
-                        (hit == nullptr || s.pos > hit->pos))
-                        hit = &s;
+            req_cacheable = !o.no_prefix_cache;
+            req_entry = nullptr;
+            req_bounds.clear();
+            req_img_first = -1;
+            if (geni) {
+                for (int64_t i = 0; i < n; ++i)
+                    if (ids[(size_t) i] == kImagePad) { req_img_first = i; break; }
+                if (req_img_first < 0) req_img_first = n;
             }
-            if (geni) prefix_cache.clear();
+            const int64_t req_key_len = geni ? req_img_first : n;  // GENI entries cover the text prefix
+            const PrefixSnap* hit = nullptr;
+            const PrefixEntry* hit_entry = nullptr;
+            int64_t hit_lcp = 0;
+            const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+            if (req_cacheable) {
+                const int64_t cap = geni ? req_img_first : n;
+                for (const auto& e : prefix_cache.entries) {
+                    if (e->kv_int8 != ss.qsa_states[0].kv_int8) continue;
+                    int64_t lcp = 0;
+                    const int64_t lim = std::min(cap, (int64_t) e->ids.size());
+                    while (lcp < lim && e->ids[(size_t) lcp] == ids[(size_t) lcp]) ++lcp;
+                    if (lcp == 0) continue;
+                    for (const PrefixSnap& s : e->snaps) {
+                        if (s.pos > lcp || s.prompt_len > n || s.mtp_first > req_mtp_first) continue;
+                        if (hit == nullptr || s.pos > hit->pos ||
+                            (s.pos == hit->pos && lcp > hit_lcp)) {
+                            hit = &s;
+                            hit_entry = e.get();
+                            hit_lcp = lcp;
+                        }
+                    }
+                }
+            }
             int64_t pre0 = 0;
             if (hit != nullptr) {
                 pre0 = hit->pos;
                 const int32_t pp0 = pre0 >= 2 ? (int32_t) ids[(size_t) (pre0 - 2)] : -1;
                 const int32_t pp1 = pre0 >= 1 ? (int32_t) ids[(size_t) (pre0 - 1)] : -1;
-                if (!prefix_restore(g, ss, *hit, main_cs, err)) {
+                bool ok = prefix_restore_snap(g, ss, *hit, main_cs, err);
+                // the entry's own KV rows [0, entry) plus the pooled rows + `dead` the in-between
+                // requests clobbered.  The suffix prefill then rewrites rows [snap, entry) itself, so
+                // the uploaded range is always a subset of what suffix prefill overwrites before any
+                // query reads it.  Spare row: copy the take-time row, then refresh it to `dead` (the
+                // kernel maintains pooled[n_bid] == dead; at take time the row held the same value).
+                if (ok) {
+                    const int64_t rows = (int64_t) hit_entry->ids.size();
+                    for (int64_t i = 0; ok && i < g.n_qsa_layers(); ++i)
+                        ok = prefix_kv_restore_layer(qs, ss.qsa_states[i], rows, hit_entry->kv[(size_t) i],
+                                                     main_cs, err);
+                    if (ok) {
+                        cudaStream_t cs = (cudaStream_t) main_cs;
+                        const size_t idx_dim = (size_t) g.idx_key_dim;
+                        const int64_t stride = hit_entry->pooled_stride;
+                        const int64_t nb = pre0 / qs.idx_block;
+                        for (int64_t i = 0; ok && i < g.n_qsa_layers(); ++i) {
+                            if (cudaMemcpyAsync(ss.qsa_states[i].idx_pooled,
+                                                hit_entry->pooled.data() + (size_t) i * (size_t) stride * idx_dim,
+                                                (size_t) nb * idx_dim * 4, cudaMemcpyHostToDevice, cs) !=
+                                    cudaSuccess ||
+                                cudaMemcpyAsync(ss.qsa_states[i].idx_pooled + (size_t) nb * idx_dim,
+                                                hit_entry->dead.data() + (size_t) i * idx_dim, idx_dim * 4,
+                                                cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+                                cudaMemcpyAsync(ss.qsa_states[i].idx_dead,
+                                                hit_entry->dead.data() + (size_t) i * idx_dim, idx_dim * 4,
+                                                cudaMemcpyHostToDevice, cs) != cudaSuccess)
+                                ok = false;
+                        }
+                        if (ok && cudaStreamSynchronize(cs) != cudaSuccess) ok = false;
+                        if (!ok && err.empty()) err = "prefix restore: pooled/dead upload";
+                    }
+                    if (!ok) err = "prefix restore with KV: " + err;
+                }
+                if (!ok) {
                     std::fprintf(stderr, "strata serve: %s; falling back to full prefill\n", err.c_str());
-                    prefix_cache.clear();
-                    req_cacheable = !o.no_prefix_cache && !geni;
+                    err.clear();
+                    req_cacheable = !o.no_prefix_cache;
+                    hit = nullptr;
+                    hit_entry = nullptr;
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     cudaStreamSynchronize(main_stream);
                     pre0 = 0;
                 } else {
                     ss.ple_prev[0] = pp0;
                     ss.ple_prev[1] = pp1;
+                    // the MTP draft layer keeps its own K/V: zero it so its window cells are rebuilt by
+                    // this request's prefill (drafts never decide a token; a stale K/V would only cost
+                    // accepts).  Its skip guard above keeps the cross-request case correct.
                     std::fprintf(stderr, "strata serve: prefix reuse: lcp %lld, resume at %lld, prefilling %lld "
                                          "of %lld prompt tokens\n",
-                                 (long long) lcp, (long long) pre0, (long long) (n - 1 - pre0), (long long) n);
+                                 (long long) hit_lcp, (long long) pre0, (long long) (n - 1 - pre0), (long long) n);
                 }
             } else {
-                if (!prefix_cache.prev_ids.empty() && req_cacheable)
-                    std::fprintf(stderr, "strata serve: prefix reuse: lcp %lld too short, full prefill\n",
-                                 (long long) lcp);
+                if (req_cacheable && !prefix_cache.entries.empty())
+                    std::fprintf(stderr, "strata serve: prefix reuse: no reusable snapshot, full prefill\n");
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
             }
-            prefix_cache.clear();   // the restored bytes are already back on the device; the
-                                    // prefill below takes this request's own snapshots
+            // P8c: this request's entry under construction.  Snapshot boundaries: every full prefill
+            // chunk end from the resume point on, plus <|im_end|> message ends inside them (message ends
+            // are required to sit on 4-token multiples for the pooled rows below to be final).  Requests
+            // too short for any boundary (< 2 chunks) leave no entry, so aux title requests never evict
+            // the main entry: they only append when they themselves are long.
+            if (req_cacheable && req_key_len - 1 - pre0 >= o.prefill_chunk) {
+                req_entry = std::make_shared<PrefixEntry>();
+                req_entry->ids.assign(ids.begin(), ids.begin() + (size_t) req_key_len);
+                for (int64_t b = pre0 + o.prefill_chunk; b <= req_key_len - 1; b += o.prefill_chunk) {
+                    for (int64_t i = pre0; i < b; ++i)
+                        if (ids[(size_t) i] == kImEnd && i + 1 > pre0 && (i + 1) % qs.idx_block == 0 &&
+                            !std::binary_search(req_bounds.begin(), req_bounds.end(), i + 1))
+                            req_bounds.push_back(i + 1);
+                    req_bounds.push_back(b);
+                }
+                std::sort(req_bounds.begin(), req_bounds.end());
+            }
             mtp.set_prompt_len(n);
             std::vector<std::pair<int32_t, int32_t>> lent_now;
             apply_pending(true);
@@ -2222,15 +2411,83 @@ int main(int argc, char** argv) {
                     }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
-            if (n - 1 > pre0 && !sp.run(ids.data() + pre0, n - 1 - pre0, pre0, err)) {
-                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-                std::printf("ERR %s\n", err.c_str());
-                prefix_cache.clear();
-                return 1;
+            // P8c: run the suffix prefill in segments split at message-end boundaries, so on_chunk
+            // snapshots the exact device state at each message end.  (A single run would only expose
+            // chunk ends; the tail at a chunk end differs from the tail at a message end inside it.)
+            {
+                std::vector<int64_t> cuts{pre0};
+                for (int64_t b : req_bounds)
+                    if (b > pre0 && b < n) cuts.push_back(b);
+                cuts.push_back(n - 1);
+                for (size_t ci = 0; ci + 1 < cuts.size(); ++ci) {
+                    const int64_t s0 = cuts[ci], s1 = cuts[ci + 1];
+                    if (s1 > s0 && !sp.run(ids.data() + s0, s1 - s0, s0, err)) {
+                        std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                        std::printf("ERR %s\n", err.c_str());
+                        req_entry = nullptr;
+                        return 1;
+                    }
+                }
             }
-            // P8b: the prefill above took this request's snapshots (via on_chunk); a request that
-            // took none (GENI, --no-prefix-cache, or a failed snapshot) leaves nothing reusable.
-            if (req_cacheable && !prefix_cache.snaps.empty()) prefix_cache.prev_ids = ids;
+            // P8c: commit this request's entry: KV rows [0, key_len) from the device (which now holds
+            // exactly this prompt's cold state: restored prefix + fresh suffix), pooled rows for the
+            // completed blocks below the largest snapshot plus the spare row, and `dead`.
+            // NOTE: pooled rows are complete blocks only plus the spare slot at row n_bid (which the
+            // kernels keep equal to `dead`; qsa.cu: a block's row becomes ordinary state once completed,
+            // and only rows <= n_bid are ever scored).  The in-progress block lives in the tail.
+            if (req_entry && !req_entry->snaps.empty()) {
+                bool entry_ok = true;
+                req_entry->kv_int8 = ss.qsa_states[0].kv_int8;
+                req_entry->kv.resize((size_t) g.n_qsa_layers());
+                for (int64_t i = 0; entry_ok && i < g.n_qsa_layers(); ++i)
+                    entry_ok = prefix_kv_take_layer(qs, ss.qsa_states[i], req_key_len,
+                                                    req_entry->kv[(size_t) i], main_cs, err);
+                int64_t max_pos = 0;
+                for (const PrefixSnap& s : req_entry->snaps) max_pos = std::max(max_pos, s.pos);
+                if (entry_ok) {
+                    const int64_t nb = max_pos / qs.idx_block;
+                    req_entry->pooled_stride = nb + 1;
+                    req_entry->pooled.resize((size_t) g.n_qsa_layers() * (size_t) (nb + 1) * (size_t) g.idx_key_dim);
+                    req_entry->dead.resize((size_t) g.n_qsa_layers() * (size_t) g.idx_key_dim);
+                    cudaStream_t cs = (cudaStream_t) main_cs;
+                    for (int64_t i = 0; entry_ok && i < g.n_qsa_layers(); ++i)
+                        if (cudaMemcpyAsync(req_entry->pooled.data() + (size_t) i * (size_t) (nb + 1) * g.idx_key_dim,
+                                            ss.qsa_states[i].idx_pooled, (size_t) (nb + 1) * g.idx_key_dim * 4,
+                                            cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+                            cudaMemcpyAsync(req_entry->dead.data() + (size_t) i * (size_t) g.idx_key_dim,
+                                            ss.qsa_states[i].idx_dead, (size_t) g.idx_key_dim * 4,
+                                            cudaMemcpyDeviceToHost, cs) != cudaSuccess)
+                            entry_ok = false;
+                    if (entry_ok && cudaStreamSynchronize(cs) != cudaSuccess) entry_ok = false;
+                    if (!entry_ok && err.empty()) err = "prefix entry: pooled/dead download";
+                }
+                if (!entry_ok) {
+                    std::fprintf(stderr, "strata serve: %s; this prompt leaves no reusable entry\n",
+                                 err.empty() ? "prefix entry take failed" : err.c_str());
+                    err.clear();
+                    prefix_cache.free_entry(*req_entry);
+                    req_entry = nullptr;
+                } else {
+                    prefix_cache.bytes += prefix_entry_bytes(*req_entry);
+                    prefix_cache.entries.push_back(req_entry);
+                    constexpr uint64_t kBudget = 4ull << 30;
+                    while (prefix_cache.bytes > kBudget && prefix_cache.entries.size() > 1) {
+                        auto old = prefix_cache.entries.front();
+                        prefix_cache.entries.erase(prefix_cache.entries.begin());
+                        prefix_cache.bytes -= std::min(prefix_cache.bytes, prefix_entry_bytes(*old));
+                        prefix_cache.free_entry(*old);
+                    }
+                    std::fprintf(stderr, "strata serve: prefix cache: %d entries, %d snapshots, %.1f MiB host\n",
+                                 (int) prefix_cache.entries.size(),
+                                 (int) std::accumulate(prefix_cache.entries.begin(), prefix_cache.entries.end(), 0,
+                                                       [](int a, const std::shared_ptr<PrefixEntry>& e) {
+                                                           return a + (int) e->snaps.size();
+                                                       }),
+                                 (double) prefix_cache.bytes / 1048576.0);
+                }
+            } else if (req_entry) {
+                req_entry = nullptr;  // short request: no snapshots, no entry (aux must not evict)
+            }
             for (const auto& [i, slot] : lent_now) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,

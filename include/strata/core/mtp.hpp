@@ -45,6 +45,9 @@ public:
               int64_t window = 32768);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    /// Plan v0.3 P8c: the draft layer's own K/V, so --serve can snapshot/restore it alongside the main
+    /// session state (drafts never decide a token, but a stale K/V would make every draft reject).
+    const QsaState& qsa_state() const { return st_; }
     uint64_t vram_bytes() const { return vram_; }
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);

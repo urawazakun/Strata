@@ -1,13 +1,14 @@
-"""prefix_cache_check.py - correctness test for --serve prompt prefix reuse.
+"""prefix_cache_check.py - correctness test for --serve multi-prompt prefix reuse.
 
 Drives a resident `strata --serve` engine over the GEN protocol:
-  1. GEN(A) then GEN(A+B): the second request reuses A's snapshots.
-  2. GEN(X) (unrelated) then GEN(A+B): the second request is a cold full prefill.
-Compares the full greedy output token sequences and DONE lines: they must be identical.
-Also replays a small Hermes-like 3-turn transcript both ways (reuse vs forced-cold).
+  part 1: GEN(A) then GEN(A+B) via reuse vs a cold engine: identical greedy outputs.
+  part 2 (P8c): GEN(A), GEN(X) (short unrelated), GEN(A+B): must HIT (fast prompt +
+    engine log shows a resume) and match the cold engine.
+  part 3 (P8c): new session S2 sharing A's long system prefix: must HIT on the shared
+    prefix and match the cold engine.
+  part 4: a Hermes-like 3-turn transcript, reuse order vs a cold engine.
 
 Usage: python tools/prefix_cache_check.py [--exe ...] [--args JSON...] [--turns N]
-Writes ids files under the scratch dir for the speed replay to reuse.
 """
 from __future__ import annotations
 
@@ -38,11 +39,12 @@ def load_tokenizer():
 
 
 class Engine:
-    def __init__(self, exe: str, args: list[str], cwd: str):
+    def __init__(self, exe: str, args: list[str], cwd: str, log_name: str = "engine-stderr.log"):
         import os
         env = dict(os.environ)
         env["PATH"] = r"C:\llm-local\cuda-11.8\bin" + os.pathsep + env.get("PATH", "")
-        self.log = open(OUT_DIR / "engine-stderr.log", "a", encoding="utf-8")
+        self.log_path = OUT_DIR / log_name
+        self.log = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=self.log, text=True, bufsize=1, env=env)
@@ -71,6 +73,12 @@ class Engine:
             elif line.startswith("ERR"):
                 raise RuntimeError("engine error: " + line)
         return out, done
+
+    def last_reuse_line(self) -> str:
+        self.log.flush()
+        text = self.log_path.read_text(encoding="utf-8", errors="replace")
+        lines = [l for l in text.splitlines() if "prefix reuse:" in l]
+        return lines[-1] if lines else ""
 
     def close(self):
         try:
@@ -136,19 +144,20 @@ def main() -> int:
 
     tools = [{"name": "get_weather", "description": "weather of a city",
               "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]
-    system_text = "You are Hermes, a helpful assistant. Answer briefly."
+    # LONG shared system prefix (> 1 prefill chunk of 2048) so a new session sharing it can hit
+    system_text = ("You are Hermes, a helpful assistant. Answer briefly. " +
+                   "Note: the warehouse shelf holds boxes." * 260)
     user_texts = ["What is the capital of France? Answer in one sentence.",
                   "And its population? One sentence.",
                   "Thanks. What river runs through it? One sentence."]
-    eng = Engine(a.exe, out_args, cfg.get("cwd", str(ROOT)))
+    cwd = cfg.get("cwd", str(ROOT))
+    eng = Engine(a.exe, out_args, cwd)
+    cold = None
     try:
         # --- part 1: A then A+B via reuse vs cold ---
         msgs = [{"role": "system", "content": system_text},
                 {"role": "user", "content": user_texts[0]}]
         a_ids = tok.encode(tpl.render(msgs, tools=tools, enable_thinking=False), parse_special=True)
-        # pad A past one prefill chunk so snapshots exist (chunk is 2048 in the run config)
-        pad = tok.encode((" Note: the warehouse shelf holds boxes." * 220), parse_special=True)
-        a_ids = a_ids + pad
         b_extra = tok.encode(" Elaborate with one more short sentence.", parse_special=True)
         ab_ids = a_ids + b_extra
         x_ids = tok.encode("Completely unrelated prompt about volcanoes and tides." * 6, parse_special=True)
@@ -156,12 +165,17 @@ def main() -> int:
 
         out_a, done_a = eng.gen(a_ids, a.max_new)
         print("GEN(A) done:", done_a, flush=True)
+        print("  cache:", eng.last_reuse_line(), flush=True)
         out_reuse, done_reuse = eng.gen(ab_ids, a.max_new)
         print("GEN(A+B) via reuse done:", done_reuse, flush=True)
-        out_x, done_x = eng.gen(x_ids, a.max_new)
-        print("GEN(X) done:", done_x, flush=True)
-        out_cold, done_cold = eng.gen(ab_ids, a.max_new)
+        print("  cache:", eng.last_reuse_line(), flush=True)
+        eng.close()
+        # TRUE cold reference: a fresh engine whose cache has never seen this prompt family
+        cold = Engine(a.exe, out_args, cwd, log_name="engine-cold-stderr.log")
+        out_cold, done_cold = cold.gen(ab_ids, a.max_new)
         print("GEN(A+B) cold done:", done_cold, flush=True)
+        cold.close()
+        cold = None
 
         ok1 = out_reuse == out_cold
         print(f"part1 reuse-vs-cold token sequences identical: {ok1} "
@@ -172,31 +186,89 @@ def main() -> int:
                     print(f"  first divergence at {i}: reuse={r} cold={c}", flush=True)
                     break
 
-        # --- part 2: 3-turn transcript, reuse order vs forced-cold order ---
+        # --- part 2 (P8c): A, then short unrelated X, then A+B must HIT and match cold ---
+        # (fresh engine: A and X build entries, A+B must reuse A's entry despite X in between)
+        eng = Engine(a.exe, out_args, cwd, log_name="engine-stderr2.log")
+        eng.gen(a_ids, a.max_new)
+        out_x, done_x = eng.gen(x_ids, a.max_new)
+        print("GEN(X) done:", done_x, flush=True)
+        out_ax, done_ax = eng.gen(ab_ids, a.max_new)
+        print("GEN(A+B) after X done:", done_ax, flush=True)
+        line2 = eng.last_reuse_line()
+        print("  cache:", line2, flush=True)
+        hit2 = "resume at" in line2
+        ok2 = out_ax == out_cold
+        print(f"part2 hit-after-X: hit={hit2} identical-to-cold={ok2} (len {len(out_ax)})", flush=True)
+        if not ok2:
+            for i, (r, c) in enumerate(zip(out_ax, out_cold)):
+                if r != c:
+                    print(f"  first divergence at {i}: repair={r} cold={c}", flush=True)
+                    break
+
+        # --- part 3 (P8c): new session S2 sharing A's system prefix must HIT and match cold ---
+        msgs2 = [{"role": "system", "content": system_text},
+                 {"role": "user", "content": "What is the capital of Japan? Answer in one sentence."}]
+        s2_ids = tok.encode(tpl.render(msgs2, tools=tools, enable_thinking=False), parse_special=True)
+        lcp = 0
+        while lcp < min(len(s2_ids), len(a_ids)) and s2_ids[lcp] == a_ids[lcp]:
+            lcp += 1
+        print(f"S2={len(s2_ids)} shared-prefix LCP(S2,A)={lcp}", flush=True)
+        out_s2, done_s2 = eng.gen(s2_ids, a.max_new)
+        print("GEN(S2) done:", done_s2, flush=True)
+        line3 = eng.last_reuse_line()
+        print("  cache:", line3, flush=True)
+        hit3 = "resume at" in line3
+        eng.close()
+        cold = Engine(a.exe, out_args, cwd, log_name="engine-cold-stderr.log")
+        out_s2c, done_s2c = cold.gen(s2_ids, a.max_new)
+        print("GEN(S2) cold done:", done_s2c, flush=True)
+        cold.close()
+        cold = None
+        ok3 = out_s2 == out_s2c
+        print(f"part3 new-session hit: hit={hit3} identical-to-cold={ok3} (len {len(out_s2)})", flush=True)
+        if not ok3:
+            for i, (r, c) in enumerate(zip(out_s2, out_s2c)):
+                if r != c:
+                    print(f"  first divergence at {i}: s2={r} cold={c}", flush=True)
+                    break
+
+        # --- part 4: 3-turn transcript, reuse order vs the cold engine ---
         replies = ["Paris is the capital of France.", "About 2.1 million in the city proper.",
                    "The Seine runs through Paris."]
         prompts = render_turns(tok, tpl, tools, system_text, user_texts, replies)
         print("turn prompt lens:", [len(p) for p in prompts], flush=True)
+        eng = Engine(a.exe, out_args, cwd, log_name="engine-stderr3.log")
         turn_reuse = [eng.gen(p, a.max_new) for p in prompts]
-        turn_cold = []
-        for p in prompts:
-            eng.gen(x_ids, 8)  # evict snapshots -> next GEN is a cold full prefill
-            turn_cold.append(eng.gen(p, a.max_new))
-        ok2 = all(r[0] == c[0] for r, c in zip(turn_reuse, turn_cold))
+        eng.close()
+        cold = Engine(a.exe, out_args, cwd, log_name="engine-cold-stderr.log")
+        turn_cold = [cold.gen(p, a.max_new) for p in prompts]
+        cold.close()
+        cold = None
+        ok4 = all(r[0] == c[0] for r, c in zip(turn_reuse, turn_cold))
         for i, (r, c) in enumerate(zip(turn_reuse, turn_cold)):
             print(f"turn{i+1} reuse==cold: {r[0] == c[0]} lens {len(r[0])}/{len(c[0])} "
                   f"reuse:{r[1]} cold:{c[1]}", flush=True)
 
-        ok = ok1 and ok2
+        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4
         print("RESULT:", "PASS" if ok else "FAIL", flush=True)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUT_DIR / "result.json").write_text(json.dumps({
             "part1_identical": ok1, "part1_len": len(out_reuse),
+            "part2_hit": hit2, "part2_identical": ok2,
+            "part3_hit": hit3, "part3_identical": ok3, "part3_lcp": lcp,
             "turns_identical": [r[0] == c[0] for r, c in zip(turn_reuse, turn_cold)],
             "a_len": len(a_ids), "ab_len": len(ab_ids)}, indent=1), encoding="utf-8")
         return 0 if ok else 1
     finally:
-        eng.close()
+        try:
+            eng.close()
+        except Exception:
+            pass
+        if cold is not None:
+            try:
+                cold.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
