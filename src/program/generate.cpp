@@ -2323,6 +2323,7 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        int64_t swaps_total = 0;   // P8h: serve-loop adaptive-tier observability (per-request delta is logged)
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
@@ -2372,6 +2373,7 @@ int main(int argc, char** argv) {
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             for (float& v : drive.d.usage) v *= 0.7f;
+            swaps_total += (int64_t) swaps.size();
             return true;
         };
         std::printf("READY %lld\n", (long long) o.max_context);
@@ -2999,6 +3001,12 @@ int main(int argc, char** argv) {
             std::vector<float> dprob((size_t) S, 0.0f);
             bool first_window = true;
             int64_t produced_n = 0;
+            // P8h: the adapt phase is per-request, not global.  `rounds` used to count across the whole
+            // server lifetime, so any earlier request's length shifted this request's adapt points - the
+            // cross-request timing interference behind REPORT-PREFIX-INCREMENTAL.md's history-dependent
+            // greedy decode.  `usage` stays global by design (it is the conversation-following signal).
+            rounds = 0;
+            const int64_t swaps0 = swaps_total;
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             while (produced_n < max_new) {
@@ -3061,6 +3069,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %lld prompt tokens in %.0f ms (%.1f tok/s), %lld generated in %.0f ms "
                                  "(%.1f tok/s)\n", (long long) n, prompt_ms, prompt_ms > 0 ? 1000.0 * n / prompt_ms : 0.0,
                          (long long) produced_n, decode_ms, decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0);
+            std::fprintf(stderr, "strata serve: adaptive tier: %lld swaps this request (every %d rounds)\n",
+                         (long long) (swaps_total - swaps0), o.adapt_every);
         }
         return 0;
     }
