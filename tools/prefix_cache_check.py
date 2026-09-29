@@ -232,6 +232,40 @@ def main() -> int:
                     print(f"  first divergence at {i}: s2={r} cold={c}", flush=True)
                     break
 
+        # --- part 5 (P8d): entry from a LONGER prompt (A+B+C), then a SHORTER request
+        # sharing only A's prefix -> must HIT (the old MTP skip guard blocked every shorter
+        # prompt) and be identical to cold.  short5 is a strict truncation of long5, longer
+        # than one prefill chunk (so a snapshot sits at or below it) but clearly shorter.
+        filler = tok.encode((" The river runs through the city and the bridges cross it." * 300),
+                            parse_special=True)
+        long5_ids = a_ids + filler
+        assert len(long5_ids) >= 3500, f"long5 too short for the P8d case: {len(long5_ids)}"
+        k5 = len(long5_ids) - 1200
+        assert k5 >= 2300, f"P8d cut {k5} leaves no snapshot below it"
+        short5_ids = long5_ids[:k5]
+        print(f"long5={len(long5_ids)} short5={len(short5_ids)}", flush=True)
+        eng = Engine(a.exe, out_args, cwd, log_name="engine-stderr4.log")
+        eng.gen(long5_ids, a.max_new)
+        out_s5, done_s5 = eng.gen(short5_ids, a.max_new)
+        print("GEN(short5) after long5 done:", done_s5, flush=True)
+        line5 = eng.last_reuse_line()
+        print("  cache:", line5, flush=True)
+        hit5 = "resume at" in line5
+        eng.close()
+        cold = Engine(a.exe, out_args, cwd, log_name="engine-cold-stderr.log")
+        out_s5c, done_s5c = cold.gen(short5_ids, a.max_new)
+        print("GEN(short5) cold done:", done_s5c, flush=True)
+        cold.close()
+        cold = None
+        ok5 = out_s5 == out_s5c
+        print(f"part5 longer->shorter hit: hit={hit5} identical-to-cold={ok5} "
+              f"(len {len(out_s5)}/{len(out_s5c)})", flush=True)
+        if not ok5:
+            for i, (r, c) in enumerate(zip(out_s5, out_s5c)):
+                if r != c:
+                    print(f"  first divergence at {i}: s5={r} cold={c}", flush=True)
+                    break
+
         # --- part 4: 3-turn transcript, reuse order vs the cold engine ---
         replies = ["Paris is the capital of France.", "About 2.1 million in the city proper.",
                    "The Seine runs through Paris."]
@@ -249,13 +283,15 @@ def main() -> int:
             print(f"turn{i+1} reuse==cold: {r[0] == c[0]} lens {len(r[0])}/{len(c[0])} "
                   f"reuse:{r[1]} cold:{c[1]}", flush=True)
 
-        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4
+        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4 and ok5 and hit5
         print("RESULT:", "PASS" if ok else "FAIL", flush=True)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUT_DIR / "result.json").write_text(json.dumps({
             "part1_identical": ok1, "part1_len": len(out_reuse),
             "part2_hit": hit2, "part2_identical": ok2,
             "part3_hit": hit3, "part3_identical": ok3, "part3_lcp": lcp,
+            "part5_hit": hit5, "part5_identical": ok5,
+            "part5_long": len(long5_ids), "part5_short": len(short5_ids),
             "turns_identical": [r[0] == c[0] for r, c in zip(turn_reuse, turn_cold)],
             "a_len": len(a_ids), "ab_len": len(ab_ids)}, indent=1), encoding="utf-8")
         return 0 if ok else 1

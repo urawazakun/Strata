@@ -389,6 +389,10 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 // entries are the simplest correct scheme: no device-contents tracking, no partial-cover repair, no sharing.
 // (The first-attempt WIP used shared snapshots plus a KV-cover repair; it is strictly more complex and could
 // not hit the short-aux case its own design notes describe, so it was not reused.)
+// P8d adds the MTP draft layer's own K/V rows [0, entry_len) (one layer, ~1 KiB/token INT8) plus a cover
+// cell, and relaxes the old skip guard (which blocked every shorter prompt): a hit needs the entry's MTP
+// cover at or below max(req_mtp_first, 0), i.e. the rows the new request's suffix prefill does not rewrite
+// are rows this entry actually wrote.  Drafts never decide a token, so output is identical either way.
 //
 // BUDGET.  ~112.6 MiB per recurrent snapshot (GDN) + ~12.7 KB/token/layer INT8 KV (~20 MiB for 13K tokens,
 // 12 layers) + pooled/indexer rows.  LRU evicts oldest-first at 4 GiB total.
@@ -413,6 +417,19 @@ struct PrefixEntry {
     std::vector<float> pooled;     // n_qsa * pooled_stride * idx_dim (blocks + spare row)
     std::vector<float> dead;       // n_qsa * idx_dim (`dead` key, from cell 0's raw key)
     int64_t pooled_stride = 0;     // idx_dim rows per layer in pooled
+    // P8d (MTP guard): the MTP draft layer's own K/V rows [0, mtp_rows) as of this entry's
+    // commit, one QSA layer (same identity page table, same helpers as `kv`).  The suffix
+    // prefill only writes MTP cells >= first_needed (prompt_len - window - 64); cells below
+    // that were skipped, so `mtp_cover` is the first cell with entry-valid rows:
+    // cold-built: max(first_needed, 0); built on a hit: the parent's cover when the new
+    // request's first_needed lies at or below the resume point (the restored prefix rows
+    // stay valid), else max(first_needed, 0).  Always sound, sometimes conservative; a hit
+    // only needs [max(req_mtp_first, 0), snap) covered.  mtp_rows < 0 = no MTP copy (take
+    // failed or mode mismatch): the entry falls back to the old strict per-snap guard.
+    std::vector<uint8_t> mtp_kv;
+    int64_t mtp_rows = -1;
+    int64_t mtp_cover = 0;
+    bool mtp_int8 = false;
 };
 
 struct PrefixCache {
@@ -444,6 +461,7 @@ uint64_t prefix_entry_bytes(const PrefixEntry& e) {
     uint64_t n = (uint64_t) e.ids.size() * 8 + (uint64_t) e.pooled.size() * 4 + (uint64_t) e.dead.size() * 4;
     for (const PrefixSnap& s : e.snaps) n += prefix_snap_bytes(s);
     for (const auto& v : e.kv) n += v.size();
+    n += e.mtp_kv.size();
     return n;
 }
 
@@ -2280,9 +2298,10 @@ int main(int argc, char** argv) {
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             // P8c: over every cached entry, the LCP with its ids; resume from the largest snapshot at
-            // or before it.  The MTP draft layer's prefill skips cells below prompt_len - window - 64,
-            // so the new prompt must be no shorter than the snapshotted one, or the drafts would read
-            // skipped cells.  GENI requests can reuse the text prefix before their first image; their
+            // or before it.  P8d: the MTP draft layer's prefill skips cells below prompt_len - window
+            // - 64, so a hit additionally needs the entry's MTP cover to reach down to
+            // max(req_mtp_first, 0) (the entry's own MTP rows are restored with the snapshot).
+            // GENI requests can reuse the text prefix before their first image; their
             // own snapshots stop at the first image, and the entry is keyed by the text prefix there.
             req_n = n;
             req_mtp_first = (o.mtp_window > 0 && n > 0) ? n - o.mtp_window - 64 : 0;
@@ -2298,22 +2317,43 @@ int main(int argc, char** argv) {
             const int64_t req_key_len = geni ? req_img_first : n;  // GENI entries cover the text prefix
             const PrefixSnap* hit = nullptr;
             const PrefixEntry* hit_entry = nullptr;
+            bool hit_mtp = false;   // P8d: the hit carries the entry's MTP rows (cover-checked above)
             int64_t hit_lcp = 0;
             const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
             if (req_cacheable) {
                 const int64_t cap = geni ? req_img_first : n;
+                // P8d: the new request's suffix prefill rewrites MTP rows [snap, n) itself; rows
+                // [need, snap) below the resume point come from the entry's MTP copy, so the entry
+                // must cover them.  Cells below need were skipped by the cold prefill too (stale in
+                // both states, drafts only), and negative cells do not exist: clamp to 0.  This is
+                // what unblocks shorter prompts: with a 32K window over ~12K prompts both bounds are
+                // negative (nothing was ever skipped) and every snapshot qualifies.
+                const int64_t mtp_need = req_mtp_first > 0 ? req_mtp_first : 0;
+                const bool mtp_mode_ok = (mtp.qsa_state().kv_int8 == ss.qsa_states[0].kv_int8);
                 for (const auto& e : prefix_cache.entries) {
                     if (e->kv_int8 != ss.qsa_states[0].kv_int8) continue;
                     int64_t lcp = 0;
                     const int64_t lim = std::min(cap, (int64_t) e->ids.size());
                     while (lcp < lim && e->ids[(size_t) lcp] == ids[(size_t) lcp]) ++lcp;
                     if (lcp == 0) continue;
+                    // P8d entry-level MTP cover check (replaces the old per-snapshot
+                    // `s.prompt_len > n || s.mtp_first > req_mtp_first` skip guard, which blocked
+                    // every shorter prompt even when no MTP cell was ever skipped).  Entries without
+                    // an MTP copy keep the old strict rule per snapshot below.
+                    const bool e_mtp_ok =
+                        mtp_mode_ok && e->mtp_rows >= 0 && e->mtp_int8 == mtp.qsa_state().kv_int8 &&
+                        mtp_need >= e->mtp_cover && e->mtp_rows >= (int64_t) e->ids.size();
                     for (const PrefixSnap& s : e->snaps) {
-                        if (s.pos > lcp || s.prompt_len > n || s.mtp_first > req_mtp_first) continue;
+                        if (s.pos > lcp) continue;
+                        if (!e_mtp_ok &&
+                            (s.pos > e->mtp_rows || s.prompt_len > n || s.mtp_first > req_mtp_first))
+                            continue;
+                        if (e_mtp_ok && s.pos > e->mtp_rows) continue;
                         if (hit == nullptr || s.pos > hit->pos ||
                             (s.pos == hit->pos && lcp > hit_lcp)) {
                             hit = &s;
                             hit_entry = e.get();
+                            hit_mtp = e_mtp_ok;
                             hit_lcp = lcp;
                         }
                     }
@@ -2356,6 +2396,16 @@ int main(int argc, char** argv) {
                         if (ok && cudaStreamSynchronize(cs) != cudaSuccess) ok = false;
                         if (!ok && err.empty()) err = "prefix restore: pooled/dead upload";
                     }
+                    // P8d: the entry's MTP draft rows [0, entry) over the restored prefix cells.
+                    // The suffix prefill rewrites rows [snap, n) itself, so like the main KV the
+                    // uploaded range is a subset of what suffix prefill overwrites before any draft
+                    // reads it; rows [need, snap) stay as the entry wrote them.  Drafts never decide
+                    // a token, so even the stale tail below the entry's cover only costs accepts.
+                    if (ok && hit_mtp) {
+                        ok = prefix_kv_restore_layer(qs, mtp.qsa_state(), hit_entry->mtp_rows,
+                                                     hit_entry->mtp_kv, main_cs, err);
+                        if (!ok && err.empty()) err = "prefix restore: MTP upload";
+                    }
                     if (!ok) err = "prefix restore with KV: " + err;
                 }
                 if (!ok) {
@@ -2364,15 +2414,16 @@ int main(int argc, char** argv) {
                     req_cacheable = !o.no_prefix_cache;
                     hit = nullptr;
                     hit_entry = nullptr;
+                    hit_mtp = false;
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     cudaStreamSynchronize(main_stream);
                     pre0 = 0;
                 } else {
                     ss.ple_prev[0] = pp0;
                     ss.ple_prev[1] = pp1;
-                    // the MTP draft layer keeps its own K/V: zero it so its window cells are rebuilt by
-                    // this request's prefill (drafts never decide a token; a stale K/V would only cost
-                    // accepts).  Its skip guard above keeps the cross-request case correct.
+                    // P8d: the MTP draft layer's K/V came from the entry above (or, on an old-guard
+                    // hit without an MTP copy, stays as the previous request left it: drafts never
+                    // decide a token, so a stale K/V only costs accepts, never correctness).
                     std::fprintf(stderr, "strata serve: prefix reuse: lcp %lld, resume at %lld, prefilling %lld "
                                          "of %lld prompt tokens\n",
                                  (long long) hit_lcp, (long long) pre0, (long long) (n - 1 - pre0), (long long) n);
@@ -2442,6 +2493,22 @@ int main(int argc, char** argv) {
                 for (int64_t i = 0; entry_ok && i < g.n_qsa_layers(); ++i)
                     entry_ok = prefix_kv_take_layer(qs, ss.qsa_states[i], req_key_len,
                                                     req_entry->kv[(size_t) i], main_cs, err);
+                // P8d: the MTP draft layer's rows [0, key_len), restored on every hit so the new
+                // request's drafts attend to this entry's prefix instead of a stranger's.  A failed
+                // take drops the entry: without MTP rows it could never pay back its host bytes on
+                // a shorter prompt (the old skip guard would block the hit).
+                if (entry_ok) {
+                    req_entry->mtp_int8 = mtp.qsa_state().kv_int8;
+                    entry_ok = prefix_kv_take_layer(qs, mtp.qsa_state(), req_key_len, req_entry->mtp_kv,
+                                                    main_cs, err);
+                    if (!entry_ok && err.empty()) err = "prefix entry: MTP download";
+                }
+                if (entry_ok) {
+                    req_entry->mtp_rows = req_key_len;
+                    int64_t cover = req_mtp_first > 0 ? req_mtp_first : 0;
+                    if (hit_entry != nullptr && req_mtp_first <= pre0) cover = hit_entry->mtp_cover;
+                    req_entry->mtp_cover = cover;
+                }
                 int64_t max_pos = 0;
                 for (const PrefixSnap& s : req_entry->snaps) max_pos = std::max(max_pos, s.pos);
                 if (entry_ok) {
@@ -2477,13 +2544,18 @@ int main(int argc, char** argv) {
                         prefix_cache.bytes -= std::min(prefix_cache.bytes, prefix_entry_bytes(*old));
                         prefix_cache.free_entry(*old);
                     }
-                    std::fprintf(stderr, "strata serve: prefix cache: %d entries, %d snapshots, %.1f MiB host\n",
+                    std::fprintf(stderr, "strata serve: prefix cache: %d entries, %d snapshots, %.1f MiB host "
+                                  "(this entry: MTP %.1f MiB, %lld B/token, cover %lld)\n",
                                  (int) prefix_cache.entries.size(),
                                  (int) std::accumulate(prefix_cache.entries.begin(), prefix_cache.entries.end(), 0,
                                                        [](int a, const std::shared_ptr<PrefixEntry>& e) {
                                                            return a + (int) e->snaps.size();
                                                        }),
-                                 (double) prefix_cache.bytes / 1048576.0);
+                                 (double) prefix_cache.bytes / 1048576.0,
+                                 (double) req_entry->mtp_kv.size() / 1048576.0,
+                                 req_key_len > 0 ? (long long) (req_entry->mtp_kv.size() / (size_t) req_key_len)
+                                                 : 0,
+                                 (long long) req_entry->mtp_cover);
                 }
             } else if (req_entry) {
                 req_entry = nullptr;  // short request: no snapshots, no entry (aux must not evict)
