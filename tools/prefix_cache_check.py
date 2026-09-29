@@ -367,6 +367,60 @@ def main() -> int:
         print(f"part7 growing-turns resume-ok={ok7} identical-to-cold={ok7c}", flush=True)
         ok7 = ok7 and ok7c
 
+        # --- part 8 (P8g): >=8 growing turns, then a NEW session sharing only the system
+        # prefix must still HIT (shared prefix segments survive long sessions: every descendant
+        # entry references them, so eviction of middle turns cannot lose the system prefix).
+        msgs8 = [{"role": "system", "content": system_text},
+                 {"role": "user", "content": user_texts[0]}]
+        prompts8 = []
+        for i in range(10):
+            prompts8.append(tok.encode(tpl.render(msgs8, tools=tools, enable_thinking=False),
+                                       parse_special=True))
+            msgs8.append({"role": "assistant", "content": "",
+                          "tool_calls": [{"function": {"name": "get_weather",
+                                                      "arguments": {"city": f"Paris-{i}"}}}]})
+            msgs8.append({"role": "tool", "content": f'{{"result": "ok-{i}"}}'})
+        print("part8 turn prompt lens:", [len(p) for p in prompts8], flush=True)
+        eng = Engine(a.exe, out_args, cwd, log_name="engine-stderr7.log")
+        turn8_reuse, lines8 = [], []
+        for p in prompts8:
+            turn8_reuse.append(eng.gen(p, a.max_new))
+            lines8.append(eng.last_reuse_line())
+        for i, l in enumerate(lines8):
+            print(f"  turn{i+1} cache:", l, flush=True)
+        resumes8 = [int(m.group(1)) if (m := re.search(r"resume at (\d+)", l)) else -1
+                    for l in lines8]
+        ok8 = True
+        for i in range(1, 10):
+            want, got = len(prompts8[i - 1]) - 8, resumes8[i]
+            good = got >= want
+            ok8 = ok8 and good
+            print(f"part8 turn{i+1} resume={got} want>={want} (prev_len {len(prompts8[i-1])}): "
+                  f"{'OK' if good else 'STUCK'}", flush=True)
+        msgs8n = [{"role": "system", "content": system_text},
+                  {"role": "user", "content": "What is the capital of Italy? Answer in one sentence."}]
+        s8_ids = tok.encode(tpl.render(msgs8n, tools=tools, enable_thinking=False), parse_special=True)
+        lcp8 = 0
+        while lcp8 < min(len(s8_ids), len(prompts8[0])) and s8_ids[lcp8] == prompts8[0][lcp8]:
+            lcp8 += 1
+        print(f"S8={len(s8_ids)} shared-prefix LCP(S8,turn1)={lcp8}", flush=True)
+        out_s8, done_s8 = eng.gen(s8_ids, a.max_new)
+        print("GEN(S8) done:", done_s8, flush=True)
+        line8 = eng.last_reuse_line()
+        print("  cache:", line8, flush=True)
+        hit8 = "resume at" in line8
+        eng.close()
+        cold = Engine(a.exe, out_args, cwd, log_name="engine-cold-stderr.log")
+        turn8_cold = [cold.gen(p, a.max_new) for p in prompts8]
+        out_s8c, done_s8c = cold.gen(s8_ids, a.max_new)
+        print("GEN(S8) cold done:", done_s8c, flush=True)
+        cold.close()
+        cold = None
+        ok8c = all(r[0] == c[0] for r, c in zip(turn8_reuse, turn8_cold)) and out_s8 == out_s8c
+        print(f"part8 10-turns resume-ok={ok8} new-session hit={hit8} identical-to-cold={ok8c}",
+              flush=True)
+        ok8 = ok8 and hit8 and ok8c
+
         # --- part 4: 3-turn transcript, reuse order vs the cold engine ---
         replies = ["Paris is the capital of France.", "About 2.1 million in the city proper.",
                    "The Seine runs through Paris."]
@@ -384,7 +438,7 @@ def main() -> int:
             print(f"turn{i+1} reuse==cold: {r[0] == c[0]} lens {len(r[0])}/{len(c[0])} "
                   f"reuse:{r[1]} cold:{c[1]}", flush=True)
 
-        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4 and ok5 and hit5 and ok6 and hit6 and ok7
+        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4 and ok5 and hit5 and ok6 and hit6 and ok7 and ok8
         print("RESULT:", "PASS" if ok else "FAIL", flush=True)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUT_DIR / "result.json").write_text(json.dumps({
@@ -397,6 +451,8 @@ def main() -> int:
             "part6_exact": hit6, "part6_identical": ok6,
             "part7_resumes": resumes7, "part7_lens": [len(p) for p in prompts7],
             "part7_ok": ok7,
+            "part8_resumes": resumes8, "part8_lens": [len(p) for p in prompts8],
+            "part8_hit": hit8, "part8_lcp": lcp8, "part8_ok": ok8,
             "turns_identical": [r[0] == c[0] for r, c in zip(turn_reuse, turn_cold)],
             "a_len": len(a_ids), "ab_len": len(ab_ids)}, indent=1), encoding="utf-8")
         return 0 if ok else 1

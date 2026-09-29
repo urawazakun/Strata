@@ -393,30 +393,54 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 // cell, and relaxes the old skip guard (which blocked every shorter prompt): a hit needs the entry's MTP
 // cover at or below max(req_mtp_first, 0), i.e. the rows the new request's suffix prefill does not rewrite
 // are rows this entry actually wrote.  Drafts never decide a token, so output is identical either way.
+// P8g (incremental, radix-lite): entries no longer duplicate the prefix bytes.  KV (main + MTP) rows live in
+// host memory as immutable page-aligned segments (std::shared_ptr blocks): an entry built on a hit REFERENCES
+// its parent's segments for the whole pages below the resume point (verified identical) and copies only the
+// new pages from the device.  Snapshots are shared the same way (parent snaps at or below the resume point
+// are reused by reference; only the new message-end / prefill-end boundaries are taken), as are the pooled
+// indexer rows (row granularity: completed blocks below the resume point are final).  Budget accounting counts
+// UNIQUE bytes; evicting an entry only drops its references, and a segment/snapshot is freed (its pinned GDN
+// buffer recycled into a pool) only when nothing references it.  Every descendant references the system-prefix
+// segments, so the shared prefix survives long sessions.  Commit D2H traffic per in-session turn drops from
+// ~1 GiB (full KV + up to 8 snapshots) to the suffix pages plus 1-3 new snapshots; output stays identical to
+// cold (restored prefix rows are always rewritten by the suffix prefill before any query reads them).
 //
 // BUDGET.  ~112.6 MiB per recurrent snapshot (GDN) + ~12.7 KB/token/layer INT8 KV (~20 MiB for 13K tokens,
-// 12 layers) + pooled/indexer rows.  LRU evicts oldest-first at 4 GiB total.
+// 12 layers) + pooled/indexer rows: counted once per unique segment.  LRU evicts oldest-first at 4 GiB unique.
 constexpr int64_t kImEnd = 248046;   // <|im_end|>: message-boundary checkpoints (system end etc.)
 struct PrefixSnap {
     int64_t pos = -1;            // tokens consumed: state == cold prefill of ids[0, pos)
     int64_t prompt_len = 0;      // the request's full prompt length (MTP skip guard)
     int64_t mtp_first = 0;       // prompt_len - window - 64 at take time
-    uint8_t* gdn = nullptr;      // pinned host, gdn_bytes
+    uint8_t* gdn = nullptr;      // pinned host, gdn_bytes (view into gdn_ref)
     uint64_t gdn_bytes = 0;
+    std::shared_ptr<uint8_t> gdn_ref;  // P8g: pooled pinned buffer, shared across entries
     std::vector<float> tails;    // n_qsa * tail_floats
     std::vector<int32_t> block_pos;   // n_qsa
     std::vector<float> ple_hist;
     int32_t ple_prev[2] = {-1, -1};
 };
 
+struct KvSeg {
+    int64_t p0 = 0, p1 = 0;                          // KV pages [p0, p1), immutable once taken
+    std::shared_ptr<std::vector<uint8_t>> bytes;     // page-range dump (take/restore_pages below)
+};
+struct KvLayer {
+    int64_t rows = 0;                 // token rows [0, rows) covered (pages [0, ceil(rows/page)))
+    std::vector<KvSeg> segs;          // ascending, contiguous, page-aligned
+};
+struct PooledSeg {
+    int64_t r0 = 0, r1 = 0;           // pooled rows [r0, r1), immutable once taken
+    std::shared_ptr<std::vector<float>> data;
+};
 struct PrefixEntry {
-    std::vector<int64_t> ids;      // this entry's prompt (KV rows [0, ids.size()) copied below)
-    std::vector<PrefixSnap> snaps;  // ascending by pos
-    bool kv_int8 = false;          // KV mode the copies below were taken in
-    std::vector<std::vector<uint8_t>> kv;  // per QSA layer, codes+scales (identity page table)
-    std::vector<float> pooled;     // n_qsa * pooled_stride * idx_dim (blocks + spare row)
-    std::vector<float> dead;       // n_qsa * idx_dim (`dead` key, from cell 0's raw key)
-    int64_t pooled_stride = 0;     // idx_dim rows per layer in pooled
+    std::vector<int64_t> ids;      // this entry's prompt (KV rows [0, ids.size()) logically below)
+    std::vector<std::shared_ptr<PrefixSnap>> snaps;  // P8g: ascending by pos, shared with the parent
+    bool kv_int8 = false;          // KV mode the segments below were taken in
+    std::vector<KvLayer> kv;       // P8g: per QSA layer, shared prefix segs + new suffix seg(s)
+    std::vector<std::vector<PooledSeg>> pooled;  // P8g: per QSA layer, completed-block rows + spare
+    std::vector<float> dead;       // n_qsa * idx_dim (`dead` key, from cell 0's raw key; tiny: per entry)
+    int64_t pooled_stride = 0;     // pooled rows per layer in the merged view (max snap pos / block + 1)
     // P8d (MTP guard): the MTP draft layer's own K/V rows [0, mtp_rows) as of this entry's
     // commit, one QSA layer (same identity page table, same helpers as `kv`).  The suffix
     // prefill only writes MTP cells >= first_needed (prompt_len - window - 64); cells below
@@ -426,7 +450,8 @@ struct PrefixEntry {
     // stay valid), else max(first_needed, 0).  Always sound, sometimes conservative; a hit
     // only needs [max(req_mtp_first, 0), snap) covered.  mtp_rows < 0 = no MTP copy (take
     // failed or mode mismatch): the entry falls back to the old strict per-snap guard.
-    std::vector<uint8_t> mtp_kv;
+    // P8g: segmented exactly like the main KV (shared prefix pages + new suffix pages).
+    KvLayer mtp;
     int64_t mtp_rows = -1;
     int64_t mtp_cover = 0;
     bool mtp_int8 = false;
@@ -434,16 +459,21 @@ struct PrefixEntry {
 
 struct PrefixCache {
     std::vector<std::shared_ptr<PrefixEntry>> entries;  // oldest first
-    uint64_t bytes = 0;
-    void free_entry(PrefixEntry& e) {
-        for (PrefixSnap& s : e.snaps)
-            if (s.gdn != nullptr) { cudaFreeHost(s.gdn); s.gdn = nullptr; }
-    }
-    void clear() {
-        for (auto& e : entries) free_entry(*e);
-        entries.clear();
-        bytes = 0;
-    }
+    uint64_t bytes = 0;   // P8g: UNIQUE host bytes (recomputed on commit/evict; shared segs count once)
+};
+
+// P8g: pinned-GDN buffer pool.  Every snapshot needs the same gdn_bytes, and a cudaHostAlloc per
+// snapshot was part of the ~2-3 s per-turn commit cost, so buffers whose last snapshot reference drops
+// are recycled instead of released.  The serve loop is single-threaded: no locking.
+std::vector<void*> g_prefix_gdn_pool;
+constexpr size_t kPrefixGdnPoolMax = 16;
+void prefix_gdn_release(uint8_t* p) {
+    if (p == nullptr) return;
+    if (g_prefix_gdn_pool.size() < kPrefixGdnPoolMax) g_prefix_gdn_pool.push_back(p);
+    else cudaFreeHost(p);
+}
+struct PrefixGdnDeleter {
+    void operator()(uint8_t* p) const { prefix_gdn_release(p); }
 };
 
 uint64_t prefix_gdn_floats(const strata::core::ModelGeometry& g) {
@@ -458,10 +488,36 @@ uint64_t prefix_snap_bytes(const PrefixSnap& s) {
 }
 
 uint64_t prefix_entry_bytes(const PrefixEntry& e) {
-    uint64_t n = (uint64_t) e.ids.size() * 8 + (uint64_t) e.pooled.size() * 4 + (uint64_t) e.dead.size() * 4;
-    for (const PrefixSnap& s : e.snaps) n += prefix_snap_bytes(s);
-    for (const auto& v : e.kv) n += v.size();
-    n += e.mtp_kv.size();
+    // Logical size (shared segments counted in full): for the per-entry log line.
+    uint64_t n = (uint64_t) e.ids.size() * 8 + (uint64_t) e.dead.size() * 4;
+    for (const auto& sp : e.snaps) n += prefix_snap_bytes(*sp);
+    for (const auto& l : e.kv)
+        for (const auto& s : l.segs) n += s.bytes ? (uint64_t) s.bytes->size() : 0;
+    for (const auto& pl : e.pooled)
+        for (const auto& s : pl) n += s.data ? (uint64_t) s.data->size() * 4 : 0;
+    for (const auto& s : e.mtp.segs) n += s.bytes ? (uint64_t) s.bytes->size() : 0;
+    return n;
+}
+
+uint64_t prefix_cache_unique_bytes(const PrefixCache& c) {
+    // P8g budget: each shared segment/snapshot counted once no matter how many entries reference it.
+    // ids + dead are per-entry (small); everything else keys on the shared object's identity.
+    std::set<const void*> seen;
+    uint64_t n = 0;
+    for (const auto& e : c.entries) {
+        n += (uint64_t) e->ids.size() * 8 + (uint64_t) e->dead.size() * 4;
+        for (const auto& l : e->kv)
+            for (const auto& s : l.segs)
+                if (s.bytes && seen.insert((const void*) s.bytes.get()).second) n += (uint64_t) s.bytes->size();
+        for (const auto& pl : e->pooled)
+            for (const auto& s : pl)
+                if (s.data && seen.insert((const void*) s.data.get()).second)
+                    n += (uint64_t) s.data->size() * 4;
+        for (const auto& s : e->mtp.segs)
+            if (s.bytes && seen.insert((const void*) s.bytes.get()).second) n += (uint64_t) s.bytes->size();
+        for (const auto& sp : e->snaps)
+            if (sp && seen.insert((const void*) sp.get()).second) n += prefix_snap_bytes(*sp);
+    }
     return n;
 }
 
@@ -469,11 +525,13 @@ uint64_t prefix_entry_bytes(const PrefixEntry& e) {
 // + token window) at the end of a prefill chunk.  The snapshot is a verbatim copy of the cold state at
 // `pos`, so a resume must start at exactly `pos` (never between snapshots: the tail below would mismatch).
 bool prefix_take_snap(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, PrefixSnap& out,
-                      int64_t pos, int64_t prompt_len, int64_t mtp_first, void* stream) {
+                      int64_t pos, int64_t prompt_len, int64_t mtp_first, void* stream,
+                      double* alloc_ms = nullptr, double* d2h_ms = nullptr) {
     auto fail = [&](const char* what) {
         std::fprintf(stderr, "strata serve: prefix snapshot at %lld failed (%s); no snapshot at this boundary\n",
                      (long long) pos, what);
-        if (out.gdn != nullptr) { cudaFreeHost(out.gdn); out.gdn = nullptr; }
+        out.gdn_ref.reset();
+        out.gdn = nullptr;
         return false;
     };
     const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
@@ -486,7 +544,21 @@ bool prefix_take_snap(const strata::core::ModelGeometry& g, strata::core::Sessio
     s.prompt_len = prompt_len;
     s.mtp_first = mtp_first;
     s.gdn_bytes = gdn_bytes;
-    if (cudaHostAlloc((void**) &s.gdn, gdn_bytes, cudaHostAllocDefault) != cudaSuccess) return fail("pinned alloc");
+    // P8g: recycle a pooled pinned buffer when one is free; its alloc latency was part of the commit cost.
+    {
+        const Clock::time_point a0 = Clock::now();
+        uint8_t* buf = nullptr;
+        if (!g_prefix_gdn_pool.empty()) {
+            buf = (uint8_t*) g_prefix_gdn_pool.back();
+            g_prefix_gdn_pool.pop_back();
+        } else if (cudaHostAlloc((void**) &buf, gdn_bytes, cudaHostAllocDefault) != cudaSuccess) {
+            return fail("pinned alloc");
+        }
+        if (alloc_ms != nullptr) *alloc_ms += std::chrono::duration<double, std::milli>(Clock::now() - a0).count();
+        s.gdn = buf;
+        s.gdn_ref = std::shared_ptr<uint8_t>(buf, PrefixGdnDeleter{});
+    }
+    const Clock::time_point d0 = Clock::now();
     cudaStream_t cs = (cudaStream_t) stream;
     if (cudaMemcpyAsync(s.gdn, ss.gdn_state, gdn_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess)
         return fail("GDN download");
@@ -505,6 +577,7 @@ bool prefix_take_snap(const strata::core::ModelGeometry& g, strata::core::Sessio
     s.ple_prev[0] = ss.ple_prev[0];
     s.ple_prev[1] = ss.ple_prev[1];
     if (cudaStreamSynchronize(cs) != cudaSuccess) return fail("sync");
+    if (d2h_ms != nullptr) *d2h_ms += std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
     out = std::move(s);
     return true;
 }
@@ -545,36 +618,45 @@ bool prefix_restore_snap(const strata::core::ModelGeometry& g, strata::core::Ses
     return true;
 }
 
-// One layer's QSA KV rows between device and host.  The page table is the identity (set once at init,
-// never re-pointed), so logical rows [0, rows) are physical pages [0, P): contiguous ranges per array.
+// P8g: one layer's QSA KV pages between device and host, by page RANGE.  The page table is the identity
+// (set once at init, never re-pointed), so logical rows [0, rows) are physical pages [0, P): contiguous
+// ranges per array, and any whole-page prefix [0, P0) restored from a parent entry is byte-identical to
+// what a fresh take would produce (the suffix prefill only writes rows at or above the resume point, and
+// P0 is floored to a page at or below it).  A segment is therefore an immutable page-range dump.
 // INT8 layout per src/kernels/cuda/kv_q8.cu: row = (page*n_head_kv + h)*page_size + (pos % page_size).
-bool prefix_kv_take_layer(const strata::kernels::QsaShapes& qs, const strata::core::QsaState& st, int64_t rows,
-                          std::vector<uint8_t>& out, void* stream, std::string& err) {
+bool prefix_kv_take_pages(const strata::kernels::QsaShapes& qs, const strata::core::QsaState& st, int64_t P0,
+                          int64_t P1, std::vector<uint8_t>& out, void* stream, std::string& err,
+                          double* d2h_ms = nullptr) {
     out.clear();
-    if (rows <= 0) return true;
+    if (P1 <= P0) return true;
+    const Clock::time_point t0 = Clock::now();
     cudaStream_t cs = (cudaStream_t) stream;
-    const int64_t P = (rows + qs.page_size - 1) / qs.page_size;
+    const uint64_t NP = (uint64_t) (P1 - P0);
     const uint64_t code_page = (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) qs.head_dim;
     if (st.kv_int8) {
         const uint64_t scale_page =
             (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-        out.resize((size_t) P * (code_page * 2 + scale_page * 2));
+        out.resize((size_t) NP * (code_page * 2 + scale_page * 2));
         uint8_t* d = out.data();
         auto dl = [&](const void* src, uint64_t n) {
             if (cudaMemcpyAsync(d, src, (size_t) n, cudaMemcpyDeviceToHost, cs) != cudaSuccess) return false;
             d += n;
             return true;
         };
-        if (!dl(st.k_q, (uint64_t) P * code_page) || !dl(st.v_q, (uint64_t) P * code_page) ||
-            !dl(st.k_scale, (uint64_t) P * scale_page) || !dl(st.v_scale, (uint64_t) P * scale_page)) {
+        if (!dl((const uint8_t*) st.k_q + (uint64_t) P0 * code_page, NP * code_page) ||
+            !dl((const uint8_t*) st.v_q + (uint64_t) P0 * code_page, NP * code_page) ||
+            !dl((const uint8_t*) st.k_scale + (uint64_t) P0 * scale_page, NP * scale_page) ||
+            !dl((const uint8_t*) st.v_scale + (uint64_t) P0 * scale_page, NP * scale_page)) {
             err = "prefix KV take: download";
             return false;
         }
     } else {
-        out.resize((size_t) P * code_page * 2 * 2);
+        out.resize((size_t) NP * code_page * 2 * 2);
         uint8_t* d = out.data();
-        if (cudaMemcpyAsync(d, st.k_pool, (size_t) P * code_page * 2, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
-            cudaMemcpyAsync(d + (size_t) P * code_page * 2, st.v_pool, (size_t) P * code_page * 2,
+        if (cudaMemcpyAsync(d, (const uint8_t*) st.k_pool + (uint64_t) P0 * code_page * 2, (size_t) NP * code_page * 2,
+                            cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+            cudaMemcpyAsync(d + (size_t) NP * code_page * 2,
+                            (const uint8_t*) st.v_pool + (uint64_t) P0 * code_page * 2, (size_t) NP * code_page * 2,
                             cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
             err = "prefix KV take: download";
             return false;
@@ -584,19 +666,20 @@ bool prefix_kv_take_layer(const strata::kernels::QsaShapes& qs, const strata::co
         err = "prefix KV take: sync";
         return false;
     }
+    if (d2h_ms != nullptr) *d2h_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     return true;
 }
 
-bool prefix_kv_restore_layer(const strata::kernels::QsaShapes& qs, const strata::core::QsaState& st, int64_t rows,
-                             const std::vector<uint8_t>& in, void* stream, std::string& err) {
-    if (rows <= 0) return true;
+bool prefix_kv_restore_pages(const strata::kernels::QsaShapes& qs, const strata::core::QsaState& st, int64_t P0,
+                             int64_t P1, const std::vector<uint8_t>& in, void* stream, std::string& err) {
+    if (P1 <= P0) return true;
     cudaStream_t cs = (cudaStream_t) stream;
-    const int64_t P = (rows + qs.page_size - 1) / qs.page_size;
+    const uint64_t NP = (uint64_t) (P1 - P0);
     const uint64_t code_page = (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) qs.head_dim;
     if (st.kv_int8) {
         const uint64_t scale_page =
             (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-        if (in.size() != (size_t) P * (code_page * 2 + scale_page * 2)) {
+        if (in.size() != (size_t) NP * (code_page * 2 + scale_page * 2)) {
             err = "prefix KV restore: size mismatch";
             return false;
         }
@@ -606,19 +689,22 @@ bool prefix_kv_restore_layer(const strata::kernels::QsaShapes& qs, const strata:
             s += n;
             return true;
         };
-        if (!ul(st.k_q, (uint64_t) P * code_page) || !ul(st.v_q, (uint64_t) P * code_page) ||
-            !ul(st.k_scale, (uint64_t) P * scale_page) || !ul(st.v_scale, (uint64_t) P * scale_page)) {
+        if (!ul((uint8_t*) st.k_q + (uint64_t) P0 * code_page, NP * code_page) ||
+            !ul((uint8_t*) st.v_q + (uint64_t) P0 * code_page, NP * code_page) ||
+            !ul((uint8_t*) st.k_scale + (uint64_t) P0 * scale_page, NP * scale_page) ||
+            !ul((uint8_t*) st.v_scale + (uint64_t) P0 * scale_page, NP * scale_page)) {
             err = "prefix KV restore: upload";
             return false;
         }
     } else {
-        if (in.size() != (size_t) P * code_page * 2 * 2) {
+        if (in.size() != (size_t) NP * code_page * 2 * 2) {
             err = "prefix KV restore: size mismatch";
             return false;
         }
-        if (cudaMemcpyAsync(st.k_pool, in.data(), (size_t) P * code_page * 2, cudaMemcpyHostToDevice, cs) !=
-                cudaSuccess ||
-            cudaMemcpyAsync(st.v_pool, in.data() + (size_t) P * code_page * 2, (size_t) P * code_page * 2,
+        if (cudaMemcpyAsync((uint8_t*) st.k_pool + (uint64_t) P0 * code_page * 2, in.data(),
+                            (size_t) NP * code_page * 2, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+            cudaMemcpyAsync((uint8_t*) st.v_pool + (uint64_t) P0 * code_page * 2,
+                            in.data() + (size_t) NP * code_page * 2, (size_t) NP * code_page * 2,
                             cudaMemcpyHostToDevice, cs) != cudaSuccess) {
             err = "prefix KV restore: upload";
             return false;
@@ -628,6 +714,113 @@ bool prefix_kv_restore_layer(const strata::kernels::QsaShapes& qs, const strata:
         err = "prefix KV restore: sync";
         return false;
     }
+    return true;
+}
+
+bool prefix_kv_restore_layer(const strata::kernels::QsaShapes& qs, const strata::core::QsaState& st,
+                             const KvLayer& layer, void* stream, std::string& err) {
+    if (layer.rows <= 0) return true;
+    for (const KvSeg& s : layer.segs) {
+        if (!s.bytes) { err = "prefix KV restore: missing segment"; return false; }
+        if (!prefix_kv_restore_pages(qs, st, s.p0, s.p1, *s.bytes, stream, err)) return false;
+    }
+    return true;
+}
+
+uint64_t prefix_kv_page_bytes(const strata::kernels::QsaShapes& qs, bool kv_int8) {
+    const uint64_t code_page = (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) qs.head_dim;
+    if (kv_int8) {
+        const uint64_t scale_page =
+            (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+        return code_page * 2 + scale_page * 2;
+    }
+    return code_page * 2 * 2;
+}
+
+// P8g: share the parent layer's pages [0, Ppre).  A parent segment straddling Ppre cannot be shared whole
+// (its tail rows may differ); slice its head off with a host-side copy instead of re-downloading it.
+// Returns false (caller falls back to a full take) on any structural surprise.
+bool prefix_kv_share(const strata::kernels::QsaShapes& qs, bool kv_int8, const KvLayer& parent, int64_t Ppre,
+                     std::vector<KvSeg>& out_shared, uint64_t& dup_bytes) {
+    out_shared.clear();
+    if (Ppre <= 0) return true;
+    const uint64_t per_page = prefix_kv_page_bytes(qs, kv_int8);
+    int64_t cov = 0;
+    for (const KvSeg& s : parent.segs) {
+        if (!s.bytes || s.p0 != cov) return false;
+        if (s.p1 <= Ppre) {
+            if ((uint64_t) (s.p1 - s.p0) * per_page != s.bytes->size()) return false;
+            out_shared.push_back(s);
+            cov = s.p1;
+            continue;
+        }
+        if (s.p0 >= Ppre) break;
+        if ((uint64_t) (s.p1 - s.p0) * per_page != s.bytes->size()) return false;
+        KvSeg sl;
+        sl.p0 = s.p0;
+        sl.p1 = Ppre;
+        const size_t n = (size_t) (Ppre - s.p0) * (size_t) per_page;
+        auto v = std::make_shared<std::vector<uint8_t>>(s.bytes->begin(), s.bytes->begin() + n);
+        dup_bytes += (uint64_t) v->size();
+        sl.bytes = std::move(v);
+        out_shared.push_back(std::move(sl));
+        cov = Ppre;
+        break;
+    }
+    return cov == Ppre;
+}
+
+bool prefix_pooled_share(const std::vector<PooledSeg>& parent, int64_t Bpre, int64_t idx_dim,
+                         std::vector<PooledSeg>& out_shared, uint64_t& dup_bytes) {
+    out_shared.clear();
+    if (Bpre <= 0) return true;
+    int64_t cov = 0;
+    for (const PooledSeg& s : parent) {
+        if (!s.data || s.r0 != cov) return false;
+        if (s.r1 <= Bpre) {
+            out_shared.push_back(s);
+            cov = s.r1;
+            continue;
+        }
+        if (s.r0 >= Bpre) break;
+        PooledSeg sl;
+        sl.r0 = s.r0;
+        sl.r1 = Bpre;
+        const size_t n = (size_t) (Bpre - s.r0) * (size_t) idx_dim;
+        if (s.data->size() < n) return false;
+        auto v = std::make_shared<std::vector<float>>(s.data->begin(), s.data->begin() + n);
+        dup_bytes += (uint64_t) v->size() * 4;
+        sl.data = std::move(v);
+        out_shared.push_back(std::move(sl));
+        cov = Bpre;
+        break;
+    }
+    return cov == Bpre;
+}
+
+// P8g: pooled indexer rows [R0, R1) from the device (one layer).  Rows below floor(resume/idx_block) are
+// final completed blocks, shared with the parent; the suffix (plus the spare row slot) is taken fresh.
+bool prefix_pooled_take_rows(const strata::core::QsaState& st, int64_t R0, int64_t R1, int64_t idx_dim,
+                             std::shared_ptr<std::vector<float>>& out, void* stream, std::string& err,
+                             double* d2h_ms = nullptr) {
+    auto v = std::make_shared<std::vector<float>>();
+    v->resize((size_t) (R1 > R0 ? R1 - R0 : 0) * (size_t) idx_dim);
+    if (R1 > R0) {
+        const Clock::time_point t0 = Clock::now();
+        cudaStream_t cs = (cudaStream_t) stream;
+        if (cudaMemcpyAsync(v->data(), st.idx_pooled + (size_t) R0 * (size_t) idx_dim,
+                            (size_t) (R1 - R0) * (size_t) idx_dim * 4, cudaMemcpyDeviceToHost,
+                            cs) != cudaSuccess) {
+            err = "prefix entry: pooled download";
+            return false;
+        }
+        if (cudaStreamSynchronize(cs) != cudaSuccess) {
+            err = "prefix entry: pooled sync";
+            return false;
+        }
+        if (d2h_ms != nullptr) *d2h_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    }
+    out = std::move(v);
     return true;
 }
 
@@ -2079,6 +2272,8 @@ int main(int argc, char** argv) {
         int64_t req_n = 0;            // this request's prompt length (MTP skip guard)
         int64_t req_mtp_first = 0;    // cells at or below this were skipped by this request's MTP prefill
         int64_t req_img_first = -1;   // first <|image_pad|> in this request (GENI), else -1
+        double req_snap_alloc_ms = 0;  // P8g: snapshot pinned-alloc time this request (commit breakdown)
+        double req_snap_d2h_ms = 0;    // P8g: snapshot D2H time this request (commit breakdown)
         bool req_bounds_logged = false;
         std::vector<int64_t> cur;
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
@@ -2110,8 +2305,9 @@ int main(int argc, char** argv) {
                     req_bounds_logged = true;
                 }
                 PrefixSnap s;
-                if (prefix_take_snap(g, ss, s, p0 + T, req_n, req_mtp_first, main_cs))
-                    req_entry->snaps.push_back(std::move(s));
+                if (prefix_take_snap(g, ss, s, p0 + T, req_n, req_mtp_first, main_cs,
+                                     &req_snap_alloc_ms, &req_snap_d2h_ms))
+                    req_entry->snaps.push_back(std::make_shared<PrefixSnap>(std::move(s)));
             }
             return true;
         };
@@ -2308,6 +2504,8 @@ int main(int argc, char** argv) {
             req_cacheable = !o.no_prefix_cache;
             req_entry = nullptr;
             req_bounds.clear();
+            req_snap_alloc_ms = 0;
+            req_snap_d2h_ms = 0;
             req_img_first = -1;
             if (geni) {
                 for (int64_t i = 0; i < n; ++i)
@@ -2343,7 +2541,8 @@ int main(int argc, char** argv) {
                     const bool e_mtp_ok =
                         mtp_mode_ok && e->mtp_rows >= 0 && e->mtp_int8 == mtp.qsa_state().kv_int8 &&
                         mtp_need >= e->mtp_cover && e->mtp_rows >= (int64_t) e->ids.size();
-                    for (const PrefixSnap& s : e->snaps) {
+                    for (const auto& snp : e->snaps) {
+                        const PrefixSnap& s = *snp;
                         if (s.pos > lcp) continue;
                         if (!e_mtp_ok &&
                             (s.pos > e->mtp_rows || s.prompt_len > n || s.mtp_first > req_mtp_first))
@@ -2366,26 +2565,40 @@ int main(int argc, char** argv) {
                 const int32_t pp1 = pre0 >= 1 ? (int32_t) ids[(size_t) (pre0 - 1)] : -1;
                 bool ok = prefix_restore_snap(g, ss, *hit, main_cs, err);
                 // the entry's own KV rows [0, entry) plus the pooled rows + `dead` the in-between
-                // requests clobbered.  The suffix prefill then rewrites rows [snap, entry) itself, so
-                // the uploaded range is always a subset of what suffix prefill overwrites before any
-                // query reads it.  Spare row: copy the take-time row, then refresh it to `dead` (the
-                // kernel maintains pooled[n_bid] == dead; at take time the row held the same value).
+                // requests clobbered.  P8g: rows upload segment by segment (shared prefix pages, then the
+                // suffix pages); the content is identical to the old full-copy upload.  The suffix prefill
+                // then rewrites rows [snap, entry) itself, so the uploaded range is always a subset of what
+                // suffix prefill overwrites before any query reads it.  Spare row: copy the take-time row,
+                // then refresh it to `dead` (the kernel maintains pooled[n_bid] == dead; at take time the
+                // row held the same value).
                 if (ok) {
-                    const int64_t rows = (int64_t) hit_entry->ids.size();
+                    if ((int64_t) hit_entry->kv.size() != g.n_qsa_layers() ||
+                        (int64_t) hit_entry->pooled.size() != g.n_qsa_layers()) {
+                        ok = false;
+                        err = "prefix restore: entry geometry mismatch";
+                    }
                     for (int64_t i = 0; ok && i < g.n_qsa_layers(); ++i)
-                        ok = prefix_kv_restore_layer(qs, ss.qsa_states[i], rows, hit_entry->kv[(size_t) i],
+                        ok = prefix_kv_restore_layer(qs, ss.qsa_states[i], hit_entry->kv[(size_t) i],
                                                      main_cs, err);
                     if (ok) {
                         cudaStream_t cs = (cudaStream_t) main_cs;
                         const size_t idx_dim = (size_t) g.idx_key_dim;
-                        const int64_t stride = hit_entry->pooled_stride;
                         const int64_t nb = pre0 / qs.idx_block;
                         for (int64_t i = 0; ok && i < g.n_qsa_layers(); ++i) {
-                            if (cudaMemcpyAsync(ss.qsa_states[i].idx_pooled,
-                                                hit_entry->pooled.data() + (size_t) i * (size_t) stride * idx_dim,
-                                                (size_t) nb * idx_dim * 4, cudaMemcpyHostToDevice, cs) !=
-                                    cudaSuccess ||
-                                cudaMemcpyAsync(ss.qsa_states[i].idx_pooled + (size_t) nb * idx_dim,
+                            for (const PooledSeg& s : hit_entry->pooled[(size_t) i]) {
+                                if (s.r0 >= nb) break;
+                                const int64_t r1 = std::min(s.r1, nb);
+                                if (r1 <= s.r0 || !s.data) { ok = false; break; }
+                                if (cudaMemcpyAsync(ss.qsa_states[i].idx_pooled + (size_t) s.r0 * idx_dim,
+                                                    s.data->data(),  // seg base == r0
+                                                    (size_t) (r1 - s.r0) * idx_dim * 4, cudaMemcpyHostToDevice,
+                                                    cs) != cudaSuccess) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if (!ok) break;
+                            if (cudaMemcpyAsync(ss.qsa_states[i].idx_pooled + (size_t) nb * idx_dim,
                                                 hit_entry->dead.data() + (size_t) i * idx_dim, idx_dim * 4,
                                                 cudaMemcpyHostToDevice, cs) != cudaSuccess ||
                                 cudaMemcpyAsync(ss.qsa_states[i].idx_dead,
@@ -2402,8 +2615,7 @@ int main(int argc, char** argv) {
                     // reads it; rows [need, snap) stay as the entry wrote them.  Drafts never decide
                     // a token, so even the stale tail below the entry's cover only costs accepts.
                     if (ok && hit_mtp) {
-                        ok = prefix_kv_restore_layer(qs, mtp.qsa_state(), hit_entry->mtp_rows,
-                                                     hit_entry->mtp_kv, main_cs, err);
+                        ok = prefix_kv_restore_layer(qs, mtp.qsa_state(), hit_entry->mtp, main_cs, err);
                         if (!ok && err.empty()) err = "prefix restore: MTP upload";
                     }
                     if (!ok) err = "prefix restore with KV: " + err;
@@ -2421,6 +2633,16 @@ int main(int argc, char** argv) {
                 } else {
                     ss.ple_prev[0] = pp0;
                     ss.ple_prev[1] = pp1;
+                    // P8g LRU: the hit entry is the most recently used; move it to the back so the
+                    // shared system-prefix entry is the last one evicted (its segments survive anyway via
+                    // the descendant entries' references, but recency also protects its unique tail).
+                    for (size_t hi = 0; hi < prefix_cache.entries.size(); ++hi)
+                        if (prefix_cache.entries[hi].get() == hit_entry) {
+                            auto held = prefix_cache.entries[hi];
+                            prefix_cache.entries.erase(prefix_cache.entries.begin() + (ptrdiff_t) hi);
+                            prefix_cache.entries.push_back(held);
+                            break;
+                        }
                     // P8d: the MTP draft layer's K/V came from the entry above (or, on an old-guard
                     // hit without an MTP copy, stays as the previous request left it: drafts never
                     // decide a token, so a stale K/V only costs accepts, never correctness).
@@ -2509,28 +2731,129 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            // P8c: commit this request's entry: KV rows [0, key_len) from the device (which now holds
-            // exactly this prompt's cold state: restored prefix + fresh suffix), pooled rows for the
-            // completed blocks below the largest snapshot plus the spare row, and `dead`.
-            // NOTE: pooled rows are complete blocks only plus the spare slot at row n_bid (which the
-            // kernels keep equal to `dead`; qsa.cu: a block's row becomes ordinary state once completed,
-            // and only rows <= n_bid are ever scored).  The in-progress block lives in the tail.
+            // P8g incremental commit: the device now holds exactly this prompt's cold state (restored
+            // prefix + fresh suffix).  Whole KV pages at or below the resume point are byte-identical to the
+            // hit parent's segments (verified token-identical below), so the entry REFERENCES them and copies
+            // only the new pages; same for the pooled completed blocks and the snapshots at or below the
+            // resume point.  A cold request (no hit) takes everything.  Only requests with >= 1 NEW snapshot
+            // commit (the exact-duplicate case still drops out below).
             if (req_entry && !req_entry->snaps.empty()) {
+                const Clock::time_point c0 = Clock::now();
+                double kv_d2h_ms = 0;
                 bool entry_ok = true;
+                // Parent sharing: whole pages below the resume point, token-verified identical.
+                bool have_parent = (hit_entry != nullptr && hit != nullptr && pre0 > 0 &&
+                                    hit_entry->kv_int8 == ss.qsa_states[0].kv_int8 &&
+                                    (int64_t) hit_entry->kv.size() == g.n_qsa_layers());
+                int64_t Ppre = 0;
+                if (have_parent) {
+                    const int64_t parent_pages =
+                        (hit_entry->kv.empty() || hit_entry->kv[0].rows <= 0)
+                            ? 0
+                            : (hit_entry->kv[0].rows + qs.page_size - 1) / qs.page_size;
+                    Ppre = pre0 / qs.page_size;
+                    if (Ppre > parent_pages) Ppre = parent_pages;
+                    const int64_t share_end = Ppre * qs.page_size;
+                    if (share_end > (int64_t) hit_entry->ids.size() || share_end > req_key_len) {
+                        have_parent = false;
+                    } else {
+                        for (int64_t i = 0; i < share_end; ++i)
+                            if (hit_entry->ids[(size_t) i] != ids[(size_t) i]) { have_parent = false; break; }
+                    }
+                    if (have_parent) {
+                        // coverage via the share walk itself (per layer; straddles slice, gaps fail)
+                        for (const auto& l : hit_entry->kv) {
+                            std::vector<KvSeg> probe;
+                            uint64_t dummy = 0;
+                            if (!prefix_kv_share(qs, hit_entry->kv_int8, l, Ppre, probe, dummy)) {
+                                have_parent = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                const int64_t Pchild = (req_key_len + qs.page_size - 1) / qs.page_size;
+                if (have_parent && Ppre >= Pchild) have_parent = false;  // defensive: full take below
+                if (!have_parent) Ppre = 0;
                 req_entry->kv_int8 = ss.qsa_states[0].kv_int8;
                 req_entry->kv.resize((size_t) g.n_qsa_layers());
-                for (int64_t i = 0; entry_ok && i < g.n_qsa_layers(); ++i)
-                    entry_ok = prefix_kv_take_layer(qs, ss.qsa_states[i], req_key_len,
-                                                    req_entry->kv[(size_t) i], main_cs, err);
+                uint64_t kv_new = 0;
+                for (int64_t i = 0; entry_ok && i < g.n_qsa_layers(); ++i) {
+                    KvLayer L;
+                    L.rows = req_key_len;
+                    if (have_parent) {
+                        uint64_t dup = 0;
+                        if (!prefix_kv_share(qs, hit_entry->kv_int8, hit_entry->kv[(size_t) i], Ppre,
+                                             L.segs, dup)) {
+                            entry_ok = false;
+                            if (err.empty()) err = "prefix entry: KV share walk failed";
+                            break;
+                        }
+                        kv_new += dup;  // straddle slice (host-side copy, no D2H)
+                    }
+                    if (Pchild > Ppre) {
+                        KvSeg ns;
+                        ns.p0 = Ppre;
+                        ns.p1 = Pchild;
+                        auto buf = std::make_shared<std::vector<uint8_t>>();
+                        entry_ok = prefix_kv_take_pages(qs, ss.qsa_states[i], Ppre, Pchild, *buf, main_cs, err,
+                                                        &kv_d2h_ms);
+                        if (!entry_ok && err.empty()) err = "prefix entry: KV download";
+                        kv_new += (uint64_t) buf->size();
+                        ns.bytes = std::move(buf);
+                        L.segs.push_back(std::move(ns));
+                    } else if (L.segs.empty()) {
+                        entry_ok = false;
+                        if (err.empty()) err = "prefix entry: empty KV take";
+                    }
+                    req_entry->kv[(size_t) i] = std::move(L);
+                }
                 // P8d: the MTP draft layer's rows [0, key_len), restored on every hit so the new
-                // request's drafts attend to this entry's prefix instead of a stranger's.  A failed
-                // take drops the entry: without MTP rows it could never pay back its host bytes on
-                // a shorter prompt (the old skip guard would block the hit).
+                // request's drafts attend to this entry's prefix instead of a stranger's.  P8g: shared
+                // prefix pages + fresh suffix pages, like the main KV.  A failed take drops the entry:
+                // without MTP rows it could never pay back its host bytes on a shorter prompt (the old
+                // skip guard would block the hit).
+                uint64_t mtp_new = 0, mtp_total = 0;
                 if (entry_ok) {
                     req_entry->mtp_int8 = mtp.qsa_state().kv_int8;
-                    entry_ok = prefix_kv_take_layer(qs, mtp.qsa_state(), req_key_len, req_entry->mtp_kv,
-                                                    main_cs, err);
-                    if (!entry_ok && err.empty()) err = "prefix entry: MTP download";
+                    req_entry->mtp.rows = req_key_len;
+                    // P8g: MTP sharing needs the parent's MTP rows on the device (hit_mtp) in the same
+                    // mode; otherwise fall back to a full take exactly like the pre-P8g code did.
+                    bool mtp_share = have_parent && hit_mtp &&
+                                     hit_entry->mtp_int8 == mtp.qsa_state().kv_int8 &&
+                                     hit_entry->mtp_rows >= 0 &&
+                                     hit_entry->mtp.rows == (int64_t) hit_entry->ids.size() &&
+                                     !hit_entry->mtp.segs.empty();
+                    int64_t MPpre = mtp_share ? Ppre : 0;
+                    if (mtp_share) {
+                        const int64_t mpar_pages = (hit_entry->mtp.rows + qs.page_size - 1) / qs.page_size;
+                        if (MPpre > mpar_pages) MPpre = mpar_pages;
+                        uint64_t dup = 0;
+                        if (!prefix_kv_share(qs, hit_entry->mtp_int8, hit_entry->mtp, MPpre,
+                                             req_entry->mtp.segs, dup)) {
+                            mtp_share = false;
+                            MPpre = 0;
+                            req_entry->mtp.segs.clear();
+                        } else {
+                            mtp_new += dup;  // straddle slice (host-side copy, no D2H)
+                        }
+                    }
+                    if (Pchild > MPpre) {
+                        KvSeg ns;
+                        ns.p0 = MPpre;
+                        ns.p1 = Pchild;
+                        auto buf = std::make_shared<std::vector<uint8_t>>();
+                        entry_ok = prefix_kv_take_pages(qs, mtp.qsa_state(), MPpre, Pchild, *buf, main_cs, err,
+                                                        &kv_d2h_ms);
+                        if (!entry_ok && err.empty()) err = "prefix entry: MTP download";
+                        mtp_new += (uint64_t) buf->size();
+                        ns.bytes = std::move(buf);
+                        req_entry->mtp.segs.push_back(std::move(ns));
+                    } else if (req_entry->mtp.segs.empty()) {
+                        entry_ok = false;
+                        if (err.empty()) err = "prefix entry: empty MTP take";
+                    }
+                    for (const KvSeg& s : req_entry->mtp.segs) mtp_total += s.bytes ? (uint64_t) s.bytes->size() : 0;
                 }
                 if (entry_ok) {
                     req_entry->mtp_rows = req_key_len;
@@ -2538,53 +2861,121 @@ int main(int argc, char** argv) {
                     if (hit_entry != nullptr && req_mtp_first <= pre0) cover = hit_entry->mtp_cover;
                     req_entry->mtp_cover = cover;
                 }
+                // P8g: reuse the parent's snapshots at or below the resume point (same prefix tokens, so
+                // identical cold state); the new takes above are already in req_entry->snaps.
+                uint64_t snap_new = 0;
+                int n_new_snaps = 0;
+                if (entry_ok) {
+                    std::vector<std::shared_ptr<PrefixSnap>> merged;
+                    if (have_parent)
+                        for (const auto& snp : hit_entry->snaps) {
+                            if (!snp || snp->pos > pre0) continue;
+                            merged.push_back(snp);
+                        }
+                    n_new_snaps = (int) req_entry->snaps.size();
+                    for (const auto& snp : req_entry->snaps) {
+                        snap_new += prefix_snap_bytes(*snp);
+                        merged.push_back(snp);
+                    }
+                    req_entry->snaps.swap(merged);
+                }
+                // NOTE: pooled rows are complete blocks only plus the spare slot at row n_bid (which the
+                // kernels keep equal to `dead`; qsa.cu: a block's row becomes ordinary state once completed,
+                // and only rows <= n_bid are ever scored).  The in-progress block lives in the tail.
+                // P8g: completed blocks below the resume point are final: shared with the parent, the rest
+                // taken fresh (plus the spare row slot).
                 int64_t max_pos = 0;
-                for (const PrefixSnap& s : req_entry->snaps) max_pos = std::max(max_pos, s.pos);
+                for (const auto& snp : req_entry->snaps) max_pos = std::max(max_pos, snp->pos);
+                uint64_t pool_new = 0;
                 if (entry_ok) {
                     const int64_t nb = max_pos / qs.idx_block;
                     req_entry->pooled_stride = nb + 1;
-                    req_entry->pooled.resize((size_t) g.n_qsa_layers() * (size_t) (nb + 1) * (size_t) g.idx_key_dim);
+                    bool pool_share = have_parent && (int64_t) hit_entry->pooled.size() == g.n_qsa_layers();
+                    int64_t Bpre = pool_share ? pre0 / qs.idx_block : 0;
+                    if (pool_share) {
+                        if (Bpre > hit_entry->pooled_stride) Bpre = hit_entry->pooled_stride;
+                        for (const auto& pl : hit_entry->pooled) {
+                            std::vector<PooledSeg> probe;
+                            uint64_t dummy = 0;
+                            if (!prefix_pooled_share(pl, Bpre, g.idx_key_dim, probe, dummy)) {
+                                pool_share = false;
+                                break;
+                            }
+                        }
+                        if (!pool_share) Bpre = 0;
+                    }
+                    req_entry->pooled.resize((size_t) g.n_qsa_layers());
                     req_entry->dead.resize((size_t) g.n_qsa_layers() * (size_t) g.idx_key_dim);
                     cudaStream_t cs = (cudaStream_t) main_cs;
-                    for (int64_t i = 0; entry_ok && i < g.n_qsa_layers(); ++i)
-                        if (cudaMemcpyAsync(req_entry->pooled.data() + (size_t) i * (size_t) (nb + 1) * g.idx_key_dim,
-                                            ss.qsa_states[i].idx_pooled, (size_t) (nb + 1) * g.idx_key_dim * 4,
-                                            cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+                    for (int64_t i = 0; entry_ok && i < g.n_qsa_layers(); ++i) {
+                        auto& pl = req_entry->pooled[(size_t) i];
+                        if (pool_share) {
+                            uint64_t dup = 0;
+                            if (!prefix_pooled_share(hit_entry->pooled[(size_t) i], Bpre, g.idx_key_dim,
+                                                     pl, dup)) {
+                                entry_ok = false;
+                                if (err.empty()) err = "prefix entry: pooled share walk failed";
+                                break;
+                            }
+                            pool_new += dup;
+                        }
+                        if (nb + 1 > Bpre) {
+                            PooledSeg ns;
+                            ns.r0 = Bpre;
+                            ns.r1 = nb + 1;
+                            entry_ok = prefix_pooled_take_rows(ss.qsa_states[i], Bpre, nb + 1, g.idx_key_dim,
+                                                               ns.data, main_cs, err, &kv_d2h_ms);
+                            if (!entry_ok && err.empty()) err = "prefix entry: pooled download";
+                            pool_new += ns.data ? (uint64_t) ns.data->size() * 4 : 0;
+                            pl.push_back(std::move(ns));
+                        }
+                        if (entry_ok &&
                             cudaMemcpyAsync(req_entry->dead.data() + (size_t) i * (size_t) g.idx_key_dim,
                                             ss.qsa_states[i].idx_dead, (size_t) g.idx_key_dim * 4,
                                             cudaMemcpyDeviceToHost, cs) != cudaSuccess)
                             entry_ok = false;
+                    }
                     if (entry_ok && cudaStreamSynchronize(cs) != cudaSuccess) entry_ok = false;
                     if (!entry_ok && err.empty()) err = "prefix entry: pooled/dead download";
                 }
+                const double commit_ms =
+                    std::chrono::duration<double, std::milli>(Clock::now() - c0).count();
                 if (!entry_ok) {
                     std::fprintf(stderr, "strata serve: %s; this prompt leaves no reusable entry\n",
                                  err.empty() ? "prefix entry take failed" : err.c_str());
                     err.clear();
-                    prefix_cache.free_entry(*req_entry);
                     req_entry = nullptr;
                 } else {
-                    prefix_cache.bytes += prefix_entry_bytes(*req_entry);
                     prefix_cache.entries.push_back(req_entry);
                     constexpr uint64_t kBudget = 4ull << 30;
+                    prefix_cache.bytes = prefix_cache_unique_bytes(prefix_cache);
                     while (prefix_cache.bytes > kBudget && prefix_cache.entries.size() > 1) {
-                        auto old = prefix_cache.entries.front();
                         prefix_cache.entries.erase(prefix_cache.entries.begin());
-                        prefix_cache.bytes -= std::min(prefix_cache.bytes, prefix_entry_bytes(*old));
-                        prefix_cache.free_entry(*old);
+                        prefix_cache.bytes = prefix_cache_unique_bytes(prefix_cache);
                     }
+                    // P8g: snapshot totals count UNIQUE snapshots (shared ones once).
+                    int uniq_snaps = 0;
+                    {
+                        std::set<const void*> seen;
+                        for (const auto& e : prefix_cache.entries)
+                            for (const auto& snp : e->snaps)
+                                if (snp && seen.insert((const void*) snp.get()).second) ++uniq_snaps;
+                    }
+                    const uint64_t new_bytes = kv_new + mtp_new + snap_new + pool_new +
+                        (uint64_t) req_entry->ids.size() * 8 + (uint64_t) req_entry->dead.size() * 4;
                     std::fprintf(stderr, "strata serve: prefix cache: %d entries, %d snapshots, %.1f MiB host "
-                                  "(this entry: MTP %.1f MiB, %lld B/token, cover %lld)\n",
-                                 (int) prefix_cache.entries.size(),
-                                 (int) std::accumulate(prefix_cache.entries.begin(), prefix_cache.entries.end(), 0,
-                                                       [](int a, const std::shared_ptr<PrefixEntry>& e) {
-                                                           return a + (int) e->snaps.size();
-                                                       }),
+                                  "unique (this entry logical %.1f MiB, new %.1f MiB: kv %.1f + mtp %.1f + "
+                                  "snaps %d x %.1f + pool %.1f; commit %.0f ms: snap-alloc %.0f, snap-d2h %.0f, "
+                                  "kv/mtp/pool-d2h %.0f; cover %lld, %lld B/token MTP)\n",
+                                 (int) prefix_cache.entries.size(), uniq_snaps,
                                  (double) prefix_cache.bytes / 1048576.0,
-                                 (double) req_entry->mtp_kv.size() / 1048576.0,
-                                 req_key_len > 0 ? (long long) (req_entry->mtp_kv.size() / (size_t) req_key_len)
-                                                 : 0,
-                                 (long long) req_entry->mtp_cover);
+                                 (double) prefix_entry_bytes(*req_entry) / 1048576.0,
+                                 (double) new_bytes / 1048576.0, (double) kv_new / 1048576.0,
+                                 (double) mtp_new / 1048576.0, n_new_snaps,
+                                 n_new_snaps > 0 ? (double) snap_new / 1048576.0 / n_new_snaps : 0.0,
+                                 (double) pool_new / 1048576.0, commit_ms, req_snap_alloc_ms, req_snap_d2h_ms,
+                                 kv_d2h_ms, (long long) req_entry->mtp_cover,
+                                 req_key_len > 0 ? (long long) (mtp_total / (size_t) req_key_len) : 0);
                 }
             } else if (req_entry) {
                 req_entry = nullptr;  // short request: no snapshots, no entry (aux must not evict)
