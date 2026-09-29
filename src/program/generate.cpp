@@ -2089,9 +2089,9 @@ int main(int argc, char** argv) {
                                                                  : (int32_t) cur.back();
             }
             if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
-            // P8c: the state now equals a cold prefill of [0, p0+T).  Snapshot wanted boundaries:
-            // chunk ends (multiples of the indexer block, so the pooled rows below are final) and
-            // message ends, so a volatile tail re-prefills only from there.  On GENI only boundaries
+            // P8c/P8e: the state now equals a cold prefill of [0, p0+T).  Snapshot wanted boundaries
+            // (chunk ends, message ends, prefill end) arrive here as segment ends via req_bounds/cuts;
+            // every one is exact state at this pos, no alignment needed (P8e).  On GENI only boundaries
             // at or before the first image are text state worth keeping.  A failed snapshot skips it.
             if (req_cacheable && req_entry && (req_img_first < 0 || p0 + T <= req_img_first) &&
                 std::binary_search(req_bounds.begin(), req_bounds.end(), p0 + T)) {
@@ -2434,21 +2434,45 @@ int main(int argc, char** argv) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
             }
-            // P8c: this request's entry under construction.  Snapshot boundaries: every full prefill
-            // chunk end from the resume point on, plus <|im_end|> message ends inside them (message ends
-            // are required to sit on 4-token multiples for the pooled rows below to be final).  Requests
-            // too short for any boundary (< 2 chunks) leave no entry, so aux title requests never evict
-            // the main entry: they only append when they themselves are long.
+            // P8e: this request's entry under construction.  Snapshot boundaries: every full prefill
+            // chunk end from the resume point on, up to 4 <|im_end|> message ends (at least the
+            // system-close one and recent ones), plus the end of the prefill (req_key_len - 1) so a
+            // follow-up turn sharing the whole prompt resumes with ~0 re-prefill.  Message bounds
+            // need no block alignment: a snapshot is GDN + tail/block_pos + PLE state (all exact at
+            // any pos), and the pooled rows below floor(pos/4) are final completed blocks either way;
+            // the tail carries the in-progress block.  Requests too short for any boundary
+            // (< 2 chunks) leave no entry, so aux title requests never evict the main entry: they
+            // only append when they themselves are long.
             if (req_cacheable && req_key_len - 1 - pre0 >= o.prefill_chunk) {
                 req_entry = std::make_shared<PrefixEntry>();
                 req_entry->ids.assign(ids.begin(), ids.begin() + (size_t) req_key_len);
-                for (int64_t b = pre0 + o.prefill_chunk; b <= req_key_len - 1; b += o.prefill_chunk) {
-                    for (int64_t i = pre0; i < b; ++i)
-                        if (ids[(size_t) i] == kImEnd && i + 1 > pre0 && (i + 1) % qs.idx_block == 0 &&
-                            !std::binary_search(req_bounds.begin(), req_bounds.end(), i + 1))
-                            req_bounds.push_back(i + 1);
+                for (int64_t b = pre0 + o.prefill_chunk; b <= req_key_len - 1; b += o.prefill_chunk)
                     req_bounds.push_back(b);
+                // P8e message ends: positions right after each <|im_end|> inside the prefill range.
+                // Cap at 4 (each snapshot is ~112 MiB host): keep the first (system close) plus the
+                // last three (recent turns), which covers the brief's "system end + last before the
+                // final user turn" minimum and bounds the budget; bytes are counted per entry as usual.
+                {
+                    std::vector<int64_t> msg;
+                    for (int64_t i = pre0; i < req_key_len - 1; ++i)
+                        if (ids[(size_t) i] == kImEnd && i + 1 > pre0)
+                            msg.push_back(i + 1);
+                    constexpr size_t kMaxMsg = 4;
+                    if (msg.size() > kMaxMsg) {
+                        std::vector<int64_t> keep;
+                        keep.push_back(msg.front());
+                        for (size_t k = msg.size() - (kMaxMsg - 1); k < msg.size(); ++k)
+                            keep.push_back(msg[k]);
+                        msg.swap(keep);
+                    }
+                    for (int64_t m : msg)
+                        if (!std::binary_search(req_bounds.begin(), req_bounds.end(), m))
+                            req_bounds.push_back(m);
                 }
+                // P8e end-of-prefill snapshot: the suffix prefill's last on_chunk fires here, so the
+                // next turn resumes at the end of this prompt instead of the last chunk grid line.
+                if (!std::binary_search(req_bounds.begin(), req_bounds.end(), req_key_len - 1))
+                    req_bounds.push_back(req_key_len - 1);
                 std::sort(req_bounds.begin(), req_bounds.end());
             }
             mtp.set_prompt_len(n);

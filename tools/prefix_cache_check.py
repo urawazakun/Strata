@@ -266,6 +266,64 @@ def main() -> int:
                     print(f"  first divergence at {i}: s5={r} cold={c}", flush=True)
                     break
 
+        # --- part 6 (P8e): the LCP lands just after an <|im_end|> far from the 2048
+        # chunk grid -> the resume point must equal that message boundary exactly,
+        # and the output must match cold.
+        import re
+        IM_END = 248046
+        CHUNK = 2048
+
+        def sys_end_for(repeat: int) -> tuple[list[int], int]:
+            s = ("You are Hermes, a helpful assistant. Answer briefly. " +
+                 "Note: the warehouse shelf holds boxes." * repeat)
+            m = [{"role": "system", "content": s},
+                 {"role": "user", "content": user_texts[0]}]
+            p = tok.encode(tpl.render(m, tools=tools, enable_thinking=False), parse_special=True)
+            return p, p.index(IM_END) + 1  # first <|im_end|> closes the system message
+
+        base_ids, sys_end = sys_end_for(260)
+        if sys_end <= 300 or min(sys_end % CHUNK, CHUNK - sys_end % CHUNK) <= 384:
+            for r in (100, 140, 180, 220, 300):
+                base_ids, sys_end = sys_end_for(r)
+                if sys_end > 300 and min(sys_end % CHUNK, CHUNK - sys_end % CHUNK) > 384:
+                    break
+        grid_dist = min(sys_end % CHUNK, CHUNK - sys_end % CHUNK)
+        print(f"part6 base={len(base_ids)} sys_end={sys_end} (grid dist {grid_dist})", flush=True)
+        assert sys_end > 300 and grid_dist > 384, "no off-grid sys_end found"
+        p1_ids = base_ids + filler[:1500]
+        tail6 = tok.encode(" A completely different question about railways and harbors.",
+                           parse_special=True)
+        p2_ids = base_ids[:sys_end] + tail6
+        lcp6 = 0
+        while lcp6 < min(len(p1_ids), len(p2_ids)) and p1_ids[lcp6] == p2_ids[lcp6]:
+            lcp6 += 1
+        print(f"part6 p1={len(p1_ids)} p2={len(p2_ids)} LCP={lcp6}", flush=True)
+        assert lcp6 == sys_end, f"LCP {lcp6} != sys_end {sys_end}"
+        eng = Engine(a.exe, out_args, cwd, log_name="engine-stderr5.log")
+        eng.gen(p1_ids, a.max_new)
+        out_p6, done_p6 = eng.gen(p2_ids, a.max_new)
+        print("GEN(p2) after p1 done:", done_p6, flush=True)
+        line6 = eng.last_reuse_line()
+        print("  cache:", line6, flush=True)
+        m6 = re.search(r"resume at (\d+)", line6)
+        resume6 = int(m6.group(1)) if m6 else -1
+        hit6 = resume6 == sys_end
+        print(f"part6 resume={resume6} want={sys_end} exact={hit6}", flush=True)
+        eng.close()
+        cold = Engine(a.exe, out_args, cwd, log_name="engine-cold-stderr.log")
+        out_p6c, done_p6c = cold.gen(p2_ids, a.max_new)
+        print("GEN(p2) cold done:", done_p6c, flush=True)
+        cold.close()
+        cold = None
+        ok6 = out_p6 == out_p6c
+        print(f"part6 msg-boundary resume: exact={hit6} identical-to-cold={ok6} "
+              f"(len {len(out_p6)}/{len(out_p6c)})", flush=True)
+        if not ok6:
+            for i, (r, c) in enumerate(zip(out_p6, out_p6c)):
+                if r != c:
+                    print(f"  first divergence at {i}: p6={r} cold={c}", flush=True)
+                    break
+
         # --- part 4: 3-turn transcript, reuse order vs the cold engine ---
         replies = ["Paris is the capital of France.", "About 2.1 million in the city proper.",
                    "The Seine runs through Paris."]
@@ -283,7 +341,7 @@ def main() -> int:
             print(f"turn{i+1} reuse==cold: {r[0] == c[0]} lens {len(r[0])}/{len(c[0])} "
                   f"reuse:{r[1]} cold:{c[1]}", flush=True)
 
-        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4 and ok5 and hit5
+        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4 and ok5 and hit5 and ok6 and hit6
         print("RESULT:", "PASS" if ok else "FAIL", flush=True)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUT_DIR / "result.json").write_text(json.dumps({
@@ -292,6 +350,8 @@ def main() -> int:
             "part3_hit": hit3, "part3_identical": ok3, "part3_lcp": lcp,
             "part5_hit": hit5, "part5_identical": ok5,
             "part5_long": len(long5_ids), "part5_short": len(short5_ids),
+            "part6_resume": resume6, "part6_sys_end": sys_end,
+            "part6_exact": hit6, "part6_identical": ok6,
             "turns_identical": [r[0] == c[0] for r, c in zip(turn_reuse, turn_cold)],
             "a_len": len(a_ids), "ab_len": len(ab_ids)}, indent=1), encoding="utf-8")
         return 0 if ok else 1
