@@ -324,6 +324,49 @@ def main() -> int:
                     print(f"  first divergence at {i}: p6={r} cold={c}", flush=True)
                     break
 
+        # --- part 7 (P8f): in-session growing turns (Hermes shape: each turn appends an
+        # assistant tool_call + tool result, no new user text).  Each turn's resume point must be
+        # >= the previous prompt length - small slack (BPE merge at the boundary costs ~1 token);
+        # the old suffix-length commit gate stuck every turn at the first turn's prefix instead.
+        msgs7 = [{"role": "system", "content": system_text},
+                 {"role": "user", "content": user_texts[0]}]
+        calls7 = [[{"function": {"name": "get_weather", "arguments": {"city": "Paris"}}}],
+                  [{"function": {"name": "get_weather", "arguments": {"city": "Paris", "unit": "c"}}}],
+                  [{"function": {"name": "get_weather", "arguments": {"city": "Lyon"}}}]]
+        results7 = ['{"temp": "18C"}', '{"temp": "19C"}', '{"temp": "20C"}']
+        prompts7 = []
+        for i in range(4):
+            prompts7.append(tok.encode(tpl.render(msgs7, tools=tools, enable_thinking=False),
+                                       parse_special=True))
+            if i < 3:
+                msgs7.append({"role": "assistant", "content": "", "tool_calls": calls7[i]})
+                msgs7.append({"role": "tool", "content": results7[i]})
+        print("part7 turn prompt lens:", [len(p) for p in prompts7], flush=True)
+        eng = Engine(a.exe, out_args, cwd, log_name="engine-stderr6.log")
+        turn7_reuse, lines7 = [], []
+        for p in prompts7:
+            turn7_reuse.append(eng.gen(p, a.max_new))
+            lines7.append(eng.last_reuse_line())
+        for i, l in enumerate(lines7):
+            print(f"  turn{i+1} cache:", l, flush=True)
+        resumes7 = [int(m.group(1)) if (m := re.search(r"resume at (\d+)", l)) else -1
+                    for l in lines7]
+        ok7 = True
+        for i in range(1, 4):
+            want, got = len(prompts7[i - 1]) - 8, resumes7[i]
+            good = got >= want
+            ok7 = ok7 and good
+            print(f"part7 turn{i+1} resume={got} want>={want} (prev_len {len(prompts7[i-1])}): "
+                  f"{'OK' if good else 'STUCK'}", flush=True)
+        eng.close()
+        cold = Engine(a.exe, out_args, cwd, log_name="engine-cold-stderr.log")
+        turn7_cold = [cold.gen(p, a.max_new) for p in prompts7]
+        cold.close()
+        cold = None
+        ok7c = all(r[0] == c[0] for r, c in zip(turn7_reuse, turn7_cold))
+        print(f"part7 growing-turns resume-ok={ok7} identical-to-cold={ok7c}", flush=True)
+        ok7 = ok7 and ok7c
+
         # --- part 4: 3-turn transcript, reuse order vs the cold engine ---
         replies = ["Paris is the capital of France.", "About 2.1 million in the city proper.",
                    "The Seine runs through Paris."]
@@ -341,7 +384,7 @@ def main() -> int:
             print(f"turn{i+1} reuse==cold: {r[0] == c[0]} lens {len(r[0])}/{len(c[0])} "
                   f"reuse:{r[1]} cold:{c[1]}", flush=True)
 
-        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4 and ok5 and hit5 and ok6 and hit6
+        ok = ok1 and ok2 and hit2 and ok3 and hit3 and ok4 and ok5 and hit5 and ok6 and hit6 and ok7
         print("RESULT:", "PASS" if ok else "FAIL", flush=True)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUT_DIR / "result.json").write_text(json.dumps({
@@ -352,6 +395,8 @@ def main() -> int:
             "part5_long": len(long5_ids), "part5_short": len(short5_ids),
             "part6_resume": resume6, "part6_sys_end": sys_end,
             "part6_exact": hit6, "part6_identical": ok6,
+            "part7_resumes": resumes7, "part7_lens": [len(p) for p in prompts7],
+            "part7_ok": ok7,
             "turns_identical": [r[0] == c[0] for r, c in zip(turn_reuse, turn_cold)],
             "a_len": len(a_ids), "ab_len": len(ab_ids)}, indent=1), encoding="utf-8")
         return 0 if ok else 1

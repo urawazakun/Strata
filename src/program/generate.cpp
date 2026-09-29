@@ -2440,10 +2440,15 @@ int main(int argc, char** argv) {
             // follow-up turn sharing the whole prompt resumes with ~0 re-prefill.  Message bounds
             // need no block alignment: a snapshot is GDN + tail/block_pos + PLE state (all exact at
             // any pos), and the pooled rows below floor(pos/4) are final completed blocks either way;
-            // the tail carries the in-progress block.  Requests too short for any boundary
-            // (< 2 chunks) leave no entry, so aux title requests never evict the main entry: they
-            // only append when they themselves are long.
-            if (req_cacheable && req_key_len - 1 - pre0 >= o.prefill_chunk) {
+            // the tail carries the in-progress block.  P8f: the gate is the PROMPT length, not the
+            // suffix length: an in-session turn resumes near the previous prompt end (suffix of a few
+            // hundred tokens) and the old `req_key_len - 1 - pre0 >= chunk` gate left it commitless,
+            // so every later turn kept matching the older entry (LCP stuck at the first turn's prefix
+            // and the re-prefilled suffix grew each turn).  Requests too short for any boundary
+            // (< ~1 chunk of prompt) leave no entry, so aux title requests never evict the main entry:
+            // they only append when they themselves are long.  An exact-duplicate hit (pre0 == n-1)
+            // still leaves no entry: no segment runs, no snapshot fires, and the empty entry drops below.
+            if (req_cacheable && req_key_len - 1 >= o.prefill_chunk) {
                 req_entry = std::make_shared<PrefixEntry>();
                 req_entry->ids.assign(ids.begin(), ids.begin() + (size_t) req_key_len);
                 for (int64_t b = pre0 + o.prefill_chunk; b <= req_key_len - 1; b += o.prefill_chunk)
